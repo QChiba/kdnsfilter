@@ -731,7 +731,28 @@ async function routing(main) {
   const reload = () => run(() => routing(main));
   const enabled = el('input', { type: 'checkbox', checked: data.enabled });
   const minTimeout = lifetimeEditor(data.min_timeout_s);
-  const newName = el('input', { value: 'bypass', size: 12, 'aria-label': 'List name' });
+  const tp = data.tproxy;
+  const routerToo = el('input', { type: 'checkbox', checked: tp.router });
+  const proxyGroup = el('input', { id: 'proxy-group', value: tp.proxy_group || '', size: 12, placeholder: 'e.g. hysteria',
+    autocapitalize: 'none', spellcheck: 'false' });
+  const proxyMark = el('input', { id: 'proxy-mark', value: tp.proxy_mark || '', size: 8, placeholder: 'e.g. 0xff',
+    autocapitalize: 'none', spellcheck: 'false' });
+  const newName = el('input', { value: data.lists.length ? '' : 'bypass', size: 14, placeholder: 'name, e.g. vpn',
+    autocapitalize: 'none', spellcheck: 'false', 'aria-label': 'New list name' });
+  const newPort = el('input', { type: 'number', min: 1, max: 65535, step: 1, placeholder: 'TPROXY port', style: 'width:120px',
+    'aria-label': 'TPROXY port of the new list' });
+  const create = ev => {
+    ev.preventDefault();
+    run(async () => {
+      const name = newName.value.trim().toLowerCase();
+      if (!/^[a-z0-9][a-z0-9_-]{0,23}$/.test(name)) throw new Error('List name: 1-24 of a-z, 0-9, _ and -, starting with a letter or digit');
+      if (data.lists.some(l => l.name === name)) throw new Error(`List ${name} already exists`);
+      const port = newPort.value.trim() === '' ? 0 : Number(newPort.value);
+      if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('TPROXY port must be 1-65535 or empty');
+      await api('PUT', '/api/routing/lists/' + encodeURIComponent(name), { domains: [], tproxy_port: port });
+      reload();
+    }, 'List created');
+  };
 
   render(main,
     el('div', { class: 'card' },
@@ -744,15 +765,25 @@ async function routing(main) {
       el('div', { class: 'form-row' }, el('label', {}, enabled, ' Routing enabled'),
         el('label', {}, 'Minimum lifetime ', minTimeout),
         el('span', { class: 'small' }, 'from 1 minute to 7 days (168 h); e.g. 3600 s = 60 m = 1 h')),
+      el('h4', {}, 'Lists with a TPROXY port'),
+      el('div', { class: 'form-row' }, el('label', {}, routerToo, ' Also route the router\'s own traffic'),
+        el('label', { for: proxyGroup.id }, 'proxy runs as group ', proxyGroup),
+        el('label', { for: proxyMark.id }, 'or marks its sockets with ', proxyMark)),
+      el('p', { class: 'small' }, 'Devices in the LAN are always routed. For the router\'s own connections kdnsfilter must recognise the ',
+        'proxy\'s traffic, or it would be sent back into the proxy: give the group the proxy process runs as, or the mark it sets ',
+        '(sing-box routing_mark, xray sockopt.mark). ',
+        `Packets for the proxy get mark ${tp.mark} and routing table ${tp.table} (change them in the YAML config if they clash).`),
       el('div', { class: 'toolbar' }, el('button', { class: 'primary', onclick: () => run(async () => {
-        try { await api('PUT', '/api/routing', { enabled: enabled.checked, min_timeout: minTimeout.value() }); } finally { reload(); }
+        await api('PUT', '/api/routing', { enabled: enabled.checked, min_timeout: minTimeout.value(),
+          tproxy: { router: routerToo.checked, proxy_group: proxyGroup.value.trim(), proxy_mark: proxyMark.value.trim() } });
+        reload();
       }, 'Routing settings saved') }, 'Save'))),
     data.lists.map(l => routeListCard(l, data, reload)),
-    data.lists.length ? null : el('div', { class: 'card' },
-      el('h3', {}, 'Create a list'),
-      el('div', { class: 'toolbar' }, newName, el('button', { class: 'primary', onclick: () => run(async () => {
-        try { await api('PUT', '/api/routing/lists/' + encodeURIComponent(newName.value.trim()), { domains: [] }); } finally { reload(); }
-      }, 'List created') }, 'Create'))));
+    el('div', { class: 'card' },
+      el('h3', {}, 'New list'),
+      el('p', { class: 'small' }, 'Each list has its own domains and its own route: give a TPROXY port to send it through ',
+        'a proxy on the router (another port, another proxy), or leave it empty to only fill its ipsets.'),
+      el('form', { class: 'toolbar', onsubmit: create }, newName, newPort, el('button', { class: 'primary' }, 'Create'))));
 }
 
 // normalizeRouteDomain mirrors config.NormalizeDomain; a pasted link gives its host.
@@ -786,35 +817,43 @@ function scrollToLine(ta, line) {
 }
 
 // routeVia shows how a list's sets are routed: a TPROXY port kdnsfilter
-// wires up itself, or the user's own chains from the YAML config.
+// wires up itself, or the user's own chains from the YAML config (which a
+// port replaces).
 function routeVia(l, data, markUnsaved) {
-  if (l.chain || l.output_chain) {
-    const box = el('p', { class: 'small' }, 'Routed by your own chains: ',
-      l.chain ? el('code', {}, 'PREROUTING → ' + l.chain) : null, l.chain && l.output_chain ? ', ' : null,
-      l.output_chain ? el('code', {}, 'OUTPUT → ' + l.output_chain) : null, ' (set in the YAML config).');
-    box.port = () => undefined;
-    return box;
-  }
+  const ownChains = !!(l.chain || l.output_chain);
   const port = el('input', { id: 'route-port-' + l.name, type: 'number', min: 1, max: 65535, step: 1,
     value: l.tproxy_port || '', placeholder: 'e.g. 12345', style: 'width:110px', 'aria-label': 'TPROXY port of ' + l.name });
   port.addEventListener('input', markUnsaved);
+  const tp = data.tproxy;
+  const status = ownChains
+    ? el('span', { class: 'small' }, 'now routed by your own chains: ',
+      l.chain ? el('code', {}, 'PREROUTING → ' + l.chain) : null, l.chain && l.output_chain ? ', ' : null,
+      l.output_chain ? el('code', {}, 'OUTPUT → ' + l.output_chain) : null, '; a port replaces them')
+    : el('span', { class: 'small' }, l.tproxy_port
+      ? `TCP and UDP to the sets go to 127.0.0.1:${l.tproxy_port} / [::1]:${l.tproxy_port}` +
+        (tp.router ? ', the router\'s own traffic too' : ' (devices in the LAN)')
+      : 'not set: the sets ' + l.set4 + ' / ' + l.set6 + ' are only filled, route them yourself');
   const box = el('div', {},
-    el('div', { class: 'form-row' }, el('label', { for: port.id }, 'TPROXY port '), port,
-      el('span', { class: 'small' }, l.tproxy_port
-        ? `TCP and UDP to the sets go to 127.0.0.1:${l.tproxy_port} / [::1]:${l.tproxy_port} (mark ${data.tproxy.mark}, table ${data.tproxy.table})` +
-          (data.tproxy.router ? ', the router\'s own traffic too' : '')
-        : 'not set: the sets ' + l.set4 + ' / ' + l.set6 + ' are only filled, route them yourself')),
-    el('p', { class: 'small' }, 'The port your proxy (hysteria, sing-box, xray, mihomo…) listens on with TPROXY on the router. ',
-      'kdnsfilter adds the iptables chains, mark and routing table itself. Leave empty to route the sets with your own rules.'),
+    el('div', { class: 'form-row' }, el('label', { for: port.id }, 'TPROXY port '), port, status),
     data.manage_firewall ? null : el('p', { class: 'error small' }, 'nfqueue.manage_firewall is off: kdnsfilter adds no firewall rules.'));
-  box.port = () => {
+  // value returns the fields to save with the list, or throws.
+  box.value = () => {
     const v = port.value.trim();
-    if (v === '') return 0;
-    const n = Number(v);
-    if (!Number.isInteger(n) || n < 1 || n > 65535) throw new Error('TPROXY port must be 1-65535 or empty');
-    return n;
+    const n = v === '' ? 0 : Number(v);
+    if (!Number.isInteger(n) || n < 0 || n > 65535) throw new Error('TPROXY port must be 1-65535 or empty');
+    if (ownChains && n === 0) return {}; // keep the chains
+    return ownChains ? { tproxy_port: n, chain: '', output_chain: '' } : { tproxy_port: n };
   };
   return box;
+}
+
+function deleteRouteList(l, reload) {
+  confirmDo(`Delete list ${l.name}? Its ${fmtNum(l.domains.filter(d => !d.startsWith('!')).length)} domains stop being routed ` +
+    'at once. Export it first to keep a copy.', async () => {
+    await api('DELETE', '/api/routing/lists/' + encodeURIComponent(l.name));
+    toast(`List ${l.name} deleted`);
+    reload();
+  });
 }
 
 function routeListCard(l, data, reload) {
@@ -845,9 +884,9 @@ function routeListCard(l, data, reload) {
     toast(`Added ${fresh.join(', ')}. Press Save list to apply.`);
   };
   const save = () => run(async () => {
-    const tproxy_port = via.port(); // throws before anything is sent or reloaded
+    const route = via.value(); // throws before anything is sent or reloaded
     try {
-      await api('PUT', '/api/routing/lists/' + encodeURIComponent(l.name), { domains: domains.value.split('\n'), tproxy_port });
+      await api('PUT', '/api/routing/lists/' + encodeURIComponent(l.name), { domains: domains.value.split('\n'), ...route });
     } finally { reload(); }
   }, `List ${l.name} saved; addresses devices already have are being added`);
   return el('div', { class: 'card' },
@@ -862,7 +901,9 @@ function routeListCard(l, data, reload) {
     el('div', { class: 'toolbar', style: 'margin-top:8px' },
       el('button', { class: 'primary', onclick: save }, 'Save list'), unsaved,
       el('button', { title: 'Download the saved list as a text file, one domain per line',
-        onclick: () => location.assign(`/api/routing/lists/${encodeURIComponent(l.name)}/export`) }, 'Export .txt')));
+        onclick: () => location.assign(`/api/routing/lists/${encodeURIComponent(l.name)}/export`) }, 'Export .txt'),
+      // The last list stays: the page always has one to edit.
+      data.lists.length > 1 ? el('button', { class: 'danger', style: 'margin-left:auto', onclick: () => deleteRouteList(l, reload) }, 'Delete list') : null));
 }
 
 function confirmDo(question, fn) {
