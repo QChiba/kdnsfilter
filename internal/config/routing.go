@@ -30,7 +30,9 @@ type Routing struct {
 type TProxy struct {
 	// Mark is the fwmark of packets bound for the proxy; Table is the
 	// routing table that delivers them locally, and the priority of the ip
-	// rule that selects it (keep it below Keenetic's own rules, ~1000).
+	// rule that selects it (keep it below Keenetic's own rules, ~1000);
+	// Table-1 is the priority of a rule that keeps marked packets on the
+	// main table's non-default routes (the proxy's replies to the LAN).
 	Mark  uint32 `yaml:"mark"`
 	Table uint32 `yaml:"table"`
 	// Router also proxies the router's own connections to listed domains.
@@ -203,9 +205,10 @@ func (t TProxy) validate() error {
 	if t.Mark == 0 {
 		errs = append(errs, errors.New("routing.tproxy.mark must not be 0"))
 	}
-	// 0 and 253-255 are the kernel's unspec, default, main and local tables.
-	if t.Table == 0 || (t.Table >= 253 && t.Table <= 255) || t.Table >= 32766 {
-		errs = append(errs, fmt.Errorf("routing.tproxy.table %d: want 1-32765 except 253-255", t.Table))
+	// 0 and 253-255 are the kernel's unspec, default, main and local tables;
+	// table-1 is the priority of the rule in front of it.
+	if t.Table < 2 || (t.Table >= 253 && t.Table <= 255) || t.Table >= 32766 {
+		errs = append(errs, fmt.Errorf("routing.tproxy.table %d: want 2-32765 except 253-255", t.Table))
 	}
 	if t.ProxyGroup != "" && !groupRe.MatchString(t.ProxyGroup) {
 		errs = append(errs, fmt.Errorf("routing.tproxy.proxy_group %q: want a group name or gid", t.ProxyGroup))

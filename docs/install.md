@@ -195,7 +195,7 @@ domains can go to different proxies.
   ```sh
   ipset list kdf_bypass4 | head                  # addresses of listed domains
   iptables -t mangle -S KDF_TPROXY_12345         # the TPROXY chain
-  ip rule | grep 733                             # fwmark 0x2dd lookup 733
+  ip rule | grep 0x2dd                           # lookup main suppress_prefixlength 0, lookup 733
   ```
 
 ### 6.4 The router's own traffic
