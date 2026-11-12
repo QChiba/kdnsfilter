@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <style>
+    .f { fill: #2563eb; stroke: #2563eb; } .r { fill: #1d2127; } .l { fill: #f6f7f9; }
+    @media (prefers-color-scheme: dark) {
+      .f { fill: #5b8def; stroke: #5b8def; } .r { fill: #e6e8eb; } .l { fill: #111418; }
+    }
+  </style>
+  <path class="f" d="M5 6 H59 L39 26 V32 H25 V26 Z" stroke-width="2" stroke-linejoin="round"/>
+  <rect class="r" x="5" y="37" width="54" height="21" rx="6"/>
+  <circle class="l" cx="16" cy="47.5" r="3.5"/>
+  <circle class="l" cx="27" cy="47.5" r="3.5"/>
+</svg>

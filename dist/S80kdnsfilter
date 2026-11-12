@@ -1,0 +1,43 @@
+#!/bin/sh
+# Entware init script for kdnsfilter.
+ENABLED=yes
+BIN=/opt/sbin/kdnsfilter
+CONF=/opt/etc/kdnsfilter/kdnsfilter.yaml
+LOG=/opt/var/log/kdnsfilter.log
+PIDFILE=/opt/var/run/kdnsfilter.pid
+
+PATH=/opt/sbin:/opt/bin:/opt/usr/sbin:/opt/usr/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+running() {
+	[ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+start() {
+	[ "$ENABLED" = yes ] || { echo "kdnsfilter is disabled"; return 0; }
+	if running; then echo "kdnsfilter already running"; return 0; fi
+	# Keep the log small on flash-backed storage.
+	[ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 1048576 ] && mv "$LOG" "$LOG.1"
+	"$BIN" -c "$CONF" >> "$LOG" 2>&1 &
+	echo $! > "$PIDFILE"
+	sleep 1
+	if running; then echo "kdnsfilter started"; else echo "kdnsfilter failed, see $LOG"; return 1; fi
+}
+
+stop() {
+	if ! running; then echo "kdnsfilter not running"; rm -f "$PIDFILE"; return 0; fi
+	kill "$(cat "$PIDFILE")"
+	for _ in 1 2 3 4 5; do running || break; sleep 1; done
+	running && kill -9 "$(cat "$PIDFILE")"
+	rm -f "$PIDFILE"
+	# The app removes its rules on exit; make sure they're gone after a kill -9.
+	"$BIN" -c "$CONF" -firewall remove >/dev/null 2>&1
+	echo "kdnsfilter stopped"
+}
+
+case "$1" in
+	start) start ;;
+	stop) stop ;;
+	restart) stop; start ;;
+	check|status) if running; then echo "kdnsfilter is running"; else echo "kdnsfilter is not running"; exit 1; fi ;;
+	*) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kdnsfilter</title>
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
+      <path d="M5 6 H59 L39 26 V32 H25 V26 Z" fill="var(--accent)" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>
+      <rect x="5" y="37" width="54" height="21" rx="6" fill="var(--text)"/>
+      <circle cx="16" cy="47.5" r="3.5" fill="var(--bg)"/>
+      <circle cx="27" cy="47.5" r="3.5" fill="var(--bg)"/>
+    </svg>
+    kdnsfilter <span id="version" class="muted"></span>
+  </div>
+  <nav id="nav">
+    <a href="#dashboard">Dashboard</a>
+    <a href="#log">Query log</a>
+    <a href="#filters">Filters</a>
+    <a href="#routing">Routing</a>
+    <a href="#clients">Clients</a>
+    <a href="#settings">Settings</a>
+  </nav>
+  <div class="top-right">
+    <label class="switch" title="Protection">
+      <input type="checkbox" id="protection"><span></span>
+      <b id="protection-label">Protection</b>
+    </label>
+  </div>
+</header>
+
+<main id="view"></main>
+
+<dialog id="dialog"><form method="dialog" id="dialog-form"></form></dialog>
+<div id="toast" class="toast" hidden></div>
+</body>
+</html>
