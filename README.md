@@ -236,8 +236,13 @@ How the sets are routed, per list:
   KDF_TPROXY_<port>:  -m socket --transparent → MARK <mark>  (packets of connections the proxy holds)
                       -m socket → RETURN
                       -p tcp|udp → TPROXY --on-port <port> --on-ip 127.0.0.1 (::1) --tproxy-mark <mark>
+  ip rule fwmark <mark> lookup main suppress_prefixlength 0 priority <table-1>
   ip rule fwmark <mark> lookup <table> priority <table>;  ip route local default dev lo table <table>
   ```
+
+  The first ip rule keeps marked packets on the main table's LAN routes:
+  KeeneticOS sets `tcp_fwmark_accept`, so the proxy's replies to LAN devices
+  carry the mark as well.
 
   With `tproxy.router: true` also `OUTPUT … -j KDF_TPROXY_OUT_<port>`, which
   marks the router's own packets (except the proxy's, by `proxy_group` /

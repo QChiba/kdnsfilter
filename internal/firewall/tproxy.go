@@ -20,7 +20,13 @@ import (
 //	OUTPUT -m set --match-set <set> dst -j KDF_TPROXY_OUT_<port> (tproxy.router)
 //	  the proxy's own packets (proxy_group / proxy_mark): untouched
 //	  others: mark, so they are rerouted via lo into PREROUTING above
+//	ip rule fwmark <mark> lookup main suppress_prefixlength 0 (priority table-1)
 //	ip rule fwmark <mark> lookup <table>; table <table>: local default dev lo
+//
+// The first rule matters because KeeneticOS sets tcp_fwmark_accept: the
+// proxy's accepted sockets inherit the mark, so its replies to LAN devices
+// carry it too and must still leave by the main table's LAN routes; only
+// what main would send to the default route is delivered locally.
 //
 // kdnsfilter owns these chains: it rebuilds them when their rules differ
 // and deletes them when no list uses the port any more.
@@ -251,14 +257,33 @@ func ipFamily(family string) string {
 	return "-4"
 }
 
+// ipRules returns the ip rules of r with their priorities.
+func ipRules(r PolicyRoute) []struct {
+	spec []string
+	prio string
+} {
+	table := strconv.FormatUint(uint64(r.Table), 10)
+	return []struct {
+		spec []string
+		prio string
+	}{
+		{[]string{"fwmark", hex(r.Mark), "lookup", "main", "suppress_prefixlength", "0"}, strconv.FormatUint(uint64(r.Table-1), 10)},
+		{[]string{"fwmark", hex(r.Mark), "lookup", table}, table},
+	}
+}
+
 func ensureRoute(r PolicyRoute) error {
 	f, table := ipFamily(r.Family), strconv.FormatUint(uint64(r.Table), 10)
 	rules, err := command("ip", f, "rule", "show")
 	if err != nil {
 		return fmt.Errorf("ip rule: %w", err)
 	}
-	if !strings.Contains(rules, "fwmark "+hex(r.Mark)+" lookup "+table) {
-		if _, err := command("ip", f, "rule", "add", "fwmark", hex(r.Mark), "table", table, "priority", table); err != nil {
+	for _, rule := range ipRules(r) {
+		if strings.Contains(rules, strings.Join(rule.spec, " ")+" \n") || strings.Contains(rules, strings.Join(rule.spec, " ")+"\n") {
+			continue
+		}
+		args := append(append([]string{f, "rule", "add"}, rule.spec...), "priority", rule.prio)
+		if _, err := command("ip", args...); err != nil {
 			return fmt.Errorf("ip %s rule add: %w", f, err)
 		}
 	}
@@ -270,9 +295,11 @@ func ensureRoute(r PolicyRoute) error {
 
 func removeRoute(r PolicyRoute, flushTable bool) {
 	f, table := ipFamily(r.Family), strconv.FormatUint(uint64(r.Table), 10)
-	for i := 0; i < 10; i++ {
-		if _, err := command("ip", f, "rule", "del", "fwmark", hex(r.Mark), "table", table); err != nil {
-			break
+	for _, rule := range ipRules(r) {
+		for i := 0; i < 10; i++ {
+			if _, err := command("ip", append(append([]string{f, "rule", "del"}, rule.spec...), "priority", rule.prio)...); err != nil {
+				break
+			}
 		}
 	}
 	if flushTable {

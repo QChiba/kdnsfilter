@@ -108,18 +108,21 @@ func withFakeKernel(t *testing.T) *fakeKernel {
 				var out string
 				for r := range k.rules {
 					if strings.HasPrefix(r, f+" ") {
-						out += "733:\tfrom all " + strings.TrimPrefix(r, f+" ") + "\n"
+						spec, prio, _ := strings.Cut(strings.TrimPrefix(r, f+" "), " prio ")
+						out += prio + ":\tfrom all " + spec + " \n"
 					}
 				}
 				return []byte(out), nil
-			case "rule add":
-				k.rules[f+" fwmark "+args[4]+" lookup "+args[6]] = true
-			case "rule del":
-				r := f + " fwmark " + args[4] + " lookup " + args[6]
-				if !k.rules[r] {
+			case "rule add", "rule del":
+				// ip <f> rule add|del <spec...> priority <n>
+				r := f + " " + strings.Join(args[3:len(args)-2], " ") + " prio " + args[len(args)-1]
+				if args[2] == "add" {
+					k.rules[r] = true
+				} else if !k.rules[r] {
 					return nil, errors.New("no such rule")
+				} else {
+					delete(k.rules, r)
 				}
-				delete(k.rules, r)
 			}
 		}
 		return nil, nil
@@ -207,7 +210,8 @@ func TestApplyRouting(t *testing.T) {
 	if k.ran("insmod /lib/modules/4.9-ndm-5/xt_TPROXY.ko") != 1 || k.ran("insmod /lib/modules/4.9-ndm-5/xt_socket.ko") != 0 {
 		t.Errorf("modules: %v", k.cmds)
 	}
-	if !k.rules["-4 fwmark 0x2dd lookup 733"] || !k.rules["-6 fwmark 0x2dd lookup 733"] ||
+	if !k.rules["-4 fwmark 0x2dd lookup 733 prio 733"] || !k.rules["-6 fwmark 0x2dd lookup 733 prio 733"] ||
+		!k.rules["-4 fwmark 0x2dd lookup main suppress_prefixlength 0 prio 732"] || len(k.rules) != 4 ||
 		k.ran("ip -4 route replace local default dev lo table 733") != 1 {
 		t.Errorf("ip rules %v", k.rules)
 	}
@@ -242,7 +246,7 @@ func TestApplyRouting(t *testing.T) {
 	if !k.jumps["iptables PREROUTING -m set --match-set kdf_bypass4 dst -j KDF_TPROXY_7890"] || len(k.jumps) != 4 {
 		t.Errorf("jumps %v", k.jumps)
 	}
-	if len(k.rules) != 2 || k.ran("ip -4 route flush") != 0 {
+	if len(k.rules) != 4 || k.ran("ip -4 route flush") != 0 {
 		t.Errorf("ip rules %v", k.rules)
 	}
 
