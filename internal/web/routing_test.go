@@ -106,4 +106,46 @@ func TestRoutingEndpoints(t *testing.T) {
 	if got := a.Config().Routing.Lists[1].TProxyPort; got != 0 {
 		t.Errorf("port not cleared: %d", got)
 	}
+
+	// Moving a list from its own chains to a port, without resending domains.
+	if resp, v := do(t, c, "PUT", srv.URL+"/api/routing/lists/bypass", `{"tproxy_port":7890,"chain":"","output_chain":""}`); resp.StatusCode != http.StatusOK {
+		t.Fatalf("move to port: %d %v", resp.StatusCode, v)
+	}
+	if got := a.Config().Routing.Lists[0]; got.TProxyPort != 7890 || got.Chain != "" || len(got.Domains) != 3 {
+		t.Errorf("moved list: %+v", got)
+	}
+
+	// The router's own traffic needs the proxy's group or mark.
+	if resp, _ := do(t, c, "PUT", srv.URL+"/api/routing", `{"enabled":true,"min_timeout":"6h","tproxy":{"router":true}}`); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("router mode without group or mark accepted: %d", resp.StatusCode)
+	}
+	if resp, _ := do(t, c, "PUT", srv.URL+"/api/routing", `{"enabled":true,"min_timeout":"6h","tproxy":{"router":true,"proxy_mark":"zz"}}`); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("bad mark accepted: %d", resp.StatusCode)
+	}
+	if resp, v := do(t, c, "PUT", srv.URL+"/api/routing", `{"enabled":true,"min_timeout":"6h","tproxy":{"router":true,"proxy_group":"proxy","proxy_mark":"0xff"}}`); resp.StatusCode != http.StatusOK {
+		t.Fatalf("router mode: %d %v", resp.StatusCode, v)
+	}
+	_, v = do(t, c, "GET", srv.URL+"/api/routing", "")
+	if tp := v["tproxy"].(map[string]any); tp["router"] != true || tp["proxy_group"] != "proxy" || tp["proxy_mark"] != "0xff" {
+		t.Errorf("tproxy settings %v", tp)
+	}
+	// Without "tproxy" the settings stay.
+	do(t, c, "PUT", srv.URL+"/api/routing", `{"enabled":true,"min_timeout":"6h"}`)
+	if !a.Config().Routing.TProxy.Router {
+		t.Error("tproxy settings lost")
+	}
+
+	// Deleting lists: a missing one is an error, the last one stays.
+	if resp, _ := do(t, c, "DELETE", srv.URL+"/api/routing/lists/nope", ""); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("delete missing: %d", resp.StatusCode)
+	}
+	if resp, v := do(t, c, "DELETE", srv.URL+"/api/routing/lists/proxied", ""); resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete: %d %v", resp.StatusCode, v)
+	}
+	if resp, _ := do(t, c, "DELETE", srv.URL+"/api/routing/lists/bypass", ""); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("last list deleted: %d", resp.StatusCode)
+	}
+	if got := a.Config().Routing.Lists; len(got) != 1 || got[0].Name != "bypass" {
+		t.Errorf("lists after delete: %+v", got)
+	}
 }

@@ -83,6 +83,7 @@ func (s *Server) Handler() http.Handler {
 	api("GET /api/routing", s.routing)
 	api("PUT /api/routing", s.setRouting)
 	api("PUT /api/routing/lists/{name}", s.setRouteList)
+	api("DELETE /api/routing/lists/{name}", s.deleteRouteList)
 	mux.Handle("GET /api/routing/lists/{name}/export", s.guard(s.exportRouteList))
 	return s.securityHeaders(mux)
 }
@@ -716,16 +717,31 @@ func (s *Server) routing(_ http.ResponseWriter, _ *http.Request) (any, error) {
 		"lists":         lists,
 		"tproxy": map[string]any{
 			"mark": fmt.Sprintf("0x%x", rt.TProxy.Mark), "table": rt.TProxy.Table, "router": rt.TProxy.Router,
+			"proxy_group": rt.TProxy.ProxyGroup, "proxy_mark": proxyMark(rt.TProxy.ProxyMark),
 		},
 		"manage_firewall": s.app.Config().NFQueue.ManageFirewall,
 		"error":           lastErr,
 	}, nil
 }
 
+func proxyMark(m uint32) string {
+	if m == 0 {
+		return ""
+	}
+	return fmt.Sprintf("0x%x", m)
+}
+
+// setRouting changes the routing switch, the minimum lifetime and, if
+// given, how the router's own traffic reaches TPROXY ports.
 func (s *Server) setRouting(_ http.ResponseWriter, r *http.Request) (any, error) {
 	var in struct {
 		Enabled    bool   `json:"enabled"`
 		MinTimeout string `json:"min_timeout"`
+		TProxy     *struct {
+			Router     bool   `json:"router"`
+			ProxyGroup string `json:"proxy_group"`
+			ProxyMark  string `json:"proxy_mark"` // "0xff", "255" or ""
+		} `json:"tproxy"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		return nil, err
@@ -734,8 +750,19 @@ func (s *Server) setRouting(_ http.ResponseWriter, r *http.Request) (any, error)
 	if err != nil {
 		return nil, fmt.Errorf("minimum lifetime: %w", err)
 	}
+	var mark uint64
+	if in.TProxy != nil && strings.TrimSpace(in.TProxy.ProxyMark) != "" {
+		if mark, err = strconv.ParseUint(strings.TrimSpace(in.TProxy.ProxyMark), 0, 32); err != nil || mark == 0 {
+			return nil, fmt.Errorf("proxy mark %q: want a number like 0xff or 255", in.TProxy.ProxyMark)
+		}
+	}
 	return ok(s.app.Update(func(c *config.Config) error {
 		c.Routing.Enabled, c.Routing.MinTimeout = in.Enabled, config.Duration(d)
+		if t := in.TProxy; t != nil {
+			c.Routing.TProxy.Router = t.Router
+			c.Routing.TProxy.ProxyGroup = strings.TrimSpace(t.ProxyGroup)
+			c.Routing.TProxy.ProxyMark = uint32(mark)
+		}
 		return nil
 	}))
 }
@@ -744,10 +771,10 @@ func (s *Server) setRouting(_ http.ResponseWriter, r *http.Request) (any, error)
 // if given, its TPROXY port or chains; a missing list is created.
 func (s *Server) setRouteList(_ http.ResponseWriter, r *http.Request) (any, error) {
 	var in struct {
-		Domains     []string `json:"domains"`
-		TProxyPort  *uint16  `json:"tproxy_port"`
-		Chain       *string  `json:"chain"`
-		OutputChain *string  `json:"output_chain"`
+		Domains     *[]string `json:"domains"` // omitted: keep the domains
+		TProxyPort  *uint16   `json:"tproxy_port"`
+		Chain       *string   `json:"chain"`
+		OutputChain *string   `json:"output_chain"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		return nil, err
@@ -756,11 +783,13 @@ func (s *Server) setRouteList(_ http.ResponseWriter, r *http.Request) (any, erro
 	return ok(s.app.Update(func(c *config.Config) error {
 		i := slices.IndexFunc(c.Routing.Lists, func(l config.RouteList) bool { return l.Name == name })
 		if i < 0 {
-			c.Routing.Lists = append(c.Routing.Lists, config.RouteList{Name: name})
+			c.Routing.Lists = append(c.Routing.Lists, config.RouteList{Name: name, Domains: []string{}})
 			i = len(c.Routing.Lists) - 1
 		}
 		l := &c.Routing.Lists[i]
-		l.Domains = in.Domains
+		if in.Domains != nil {
+			l.Domains = *in.Domains
+		}
 		if in.TProxyPort != nil {
 			l.TProxyPort = *in.TProxyPort
 		}
@@ -770,6 +799,23 @@ func (s *Server) setRouteList(_ http.ResponseWriter, r *http.Request) (any, erro
 		if in.OutputChain != nil {
 			l.OutputChain = strings.TrimSpace(*in.OutputChain)
 		}
+		return nil
+	}))
+}
+
+// deleteRouteList removes a list: its addresses leave the sets and its
+// firewall rules go. The last list stays, so the page always has one.
+func (s *Server) deleteRouteList(_ http.ResponseWriter, r *http.Request) (any, error) {
+	name := r.PathValue("name")
+	return ok(s.app.Update(func(c *config.Config) error {
+		i := slices.IndexFunc(c.Routing.Lists, func(l config.RouteList) bool { return l.Name == name })
+		if i < 0 {
+			return fmt.Errorf("no routing list %q", name)
+		}
+		if len(c.Routing.Lists) == 1 {
+			return errors.New("the last list can't be removed; clear its domains instead")
+		}
+		c.Routing.Lists = slices.Delete(c.Routing.Lists, i, i+1)
 		return nil
 	}))
 }
