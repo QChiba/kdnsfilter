@@ -85,4 +85,25 @@ func TestRoutingEndpoints(t *testing.T) {
 	if got := a.Config().Routing.Lists[0].Domains; len(got) != 3 {
 		t.Errorf("rejected change applied: %v", got)
 	}
+	// TPROXY port: set from the UI, not together with the list's own chains.
+	if resp, _ := do(t, c, "PUT", srv.URL+"/api/routing/lists/bypass", `{"domains":["x.com"],"tproxy_port":12345}`); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("tproxy_port next to a chain accepted: %d", resp.StatusCode)
+	}
+	if resp, v := do(t, c, "PUT", srv.URL+"/api/routing/lists/proxied", `{"domains":["x.com"],"tproxy_port":12345}`); resp.StatusCode != http.StatusOK {
+		t.Fatalf("tproxy list: %d %v", resp.StatusCode, v)
+	}
+	_, v = do(t, c, "GET", srv.URL+"/api/routing", "")
+	l = v["lists"].([]any)[1].(map[string]any)
+	if l["name"] != "proxied" || l["tproxy_port"] != float64(12345) || v["tproxy"].(map[string]any)["mark"] != "0x2dd" {
+		t.Errorf("tproxy list %v / %v", l, v["tproxy"])
+	}
+	// Saving the domains alone keeps the port; 0 turns it off.
+	do(t, c, "PUT", srv.URL+"/api/routing/lists/proxied", `{"domains":["y.com"]}`)
+	if got := a.Config().Routing.Lists[1]; got.TProxyPort != 12345 || got.Domains[0] != "y.com" {
+		t.Errorf("port lost: %+v", got)
+	}
+	do(t, c, "PUT", srv.URL+"/api/routing/lists/proxied", `{"domains":["y.com"],"tproxy_port":0}`)
+	if got := a.Config().Routing.Lists[1].TProxyPort; got != 0 {
+		t.Errorf("port not cleared: %d", got)
+	}
 }

@@ -3,6 +3,7 @@
 # the mangle table. ndm passes $type (iptables/ip6tables) and $table.
 # While kdnsfilter is down only the routing rules are restored: the NFQUEUE
 # rules need the running filter, the routing sets keep working without it.
+# shellcheck disable=SC2154 # set by ndm
 [ "$table" = "mangle" ] || exit 0
 op=ensure
 pidof kdnsfilter >/dev/null 2>&1 || op=ensure-routing
