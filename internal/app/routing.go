@@ -20,9 +20,8 @@ import (
 // Overridden in tests: the kernel side of routing and the firewall.
 var (
 	newRoutingBackend = func() (routing.Backend, error) { return ipset.Dial() }
-	applyRules        = func(remove, ensure []firewall.Rule) error {
-		firewall.Remove(remove)
-		return firewall.Ensure(ensure, "")
+	applyRouting      = func(prev, next config.Routing) error {
+		return firewall.ApplyRouting(prev, next, "")
 	}
 )
 
@@ -52,8 +51,7 @@ func (a *App) routingChanged(prev, next *config.Config) {
 	}
 	added := a.Routing.Configure(next.Routing, time.Now())
 	if next.NFQueue.ManageFirewall {
-		old, cur := firewall.RoutingRules(prev.Routing), firewall.RoutingRules(next.Routing)
-		if err := applyRules(firewall.Diff(old, cur), cur); err != nil {
+		if err := applyRouting(prev.Routing, next.Routing); err != nil {
 			log.Printf("routing firewall: %v", err)
 		}
 	}

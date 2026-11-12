@@ -150,7 +150,10 @@ func Default() *Config {
 			ID: 1, Name: "AdGuard DNS filter", Enabled: true,
 			URL: "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt",
 		}},
-		Routing:     Routing{MinTimeout: Duration(DefaultRouteTimeout)},
+		Routing: Routing{
+			MinTimeout: Duration(DefaultRouteTimeout),
+			TProxy:     TProxy{Mark: DefaultTProxyMark, Table: DefaultTProxyTable},
+		},
 		QueryLog:    QueryLog{Enabled: true, Size: 5000, Interval: Duration(7 * 24 * time.Hour)},
 		Stats:       Stats{Interval: Duration(7 * 24 * time.Hour)},
 		Hostmap:     "/var/ndnproxyhostmap.conf",

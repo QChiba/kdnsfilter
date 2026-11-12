@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"slices"
 	"syscall"
 	"time"
 
@@ -46,8 +47,10 @@ func main() {
 	cfgPath := flag.String("c", "/opt/etc/kdnsfilter/kdnsfilter.yaml", "config file")
 	importAGH := flag.String("import-adguard", "", "create the config from this AdGuardHome.yaml and exit")
 	force := flag.Bool("force", false, "with -import-adguard: overwrite an existing config")
-	fw := flag.String("firewall", "", "ensure|ensure-routing|remove the firewall rules and exit (for netfilter.d hooks)")
+	fw := flag.String("firewall", "", "ensure|ensure-routing|remove|remove-all the firewall rules and exit (for netfilter.d hooks, init and uninstall)")
 	fwFamily := flag.String("family", "", "with -firewall ensure: iptables or ip6tables only")
+	tproxyPort := flag.Int("tproxy-port", -1, "set the TPROXY port of routing list -list (0 turns it off), enable routing, save the config and exit")
+	tproxyList := flag.String("list", "bypass", "with -tproxy-port: the routing list, created if missing")
 	showVersion := flag.Bool("version", false, "print version")
 	flag.Parse()
 	log.SetFlags(log.LstdFlags)
@@ -57,6 +60,8 @@ func main() {
 		fmt.Println(version)
 	case *importAGH != "":
 		exitOn(importAdGuard(*importAGH, *cfgPath, *force))
+	case *tproxyPort >= 0:
+		exitOn(setTProxyPort(*cfgPath, *tproxyList, *tproxyPort))
 	case *fw != "":
 		exitOn(firewallCmd(*cfgPath, *fw, *fwFamily))
 	default:
@@ -97,6 +102,11 @@ func run(path string) error {
 	if err != nil {
 		return err
 	}
+	// Binding the queue needs nfnetlink_queue, which KeeneticOS loads only
+	// on demand.
+	if err := firewall.LoadModules(firewall.QueueModules...); err != nil {
+		log.Printf("modules: %v", err)
+	}
 	queueErr := make(chan error, 1)
 	go func() { queueErr <- a.RunQueue(ctx, cfg.NFQueue.Queue) }()
 	// Install rules only once the queue is bound; --queue-bypass covers the gap anyway.
@@ -104,7 +114,7 @@ func run(path string) error {
 	if cfg.NFQueue.ManageFirewall {
 		// The routing rules stay when kdnsfilter stops: the sets keep their
 		// entries, so routing goes on across restarts.
-		if err := firewall.Ensure(append(rules, firewall.RoutingRules(cfg.Routing)...), ""); err != nil {
+		if err := errors.Join(firewall.Ensure(rules, ""), firewall.ApplyRouting(config.Routing{}, cfg.Routing, "")); err != nil {
 			log.Printf("firewall: %v", err)
 		}
 		defer firewall.Remove(rules)
@@ -168,7 +178,7 @@ func firewallCmd(path, op, family string) error {
 		if !cfg.NFQueue.ManageFirewall {
 			return nil
 		}
-		return errors.Join(firewall.Ensure(rules, family), ensureRouting(cfg, family))
+		return errors.Join(firewall.LoadModules(firewall.QueueModules...), firewall.Ensure(rules, family), ensureRouting(cfg, family))
 	case "ensure-routing":
 		// For the ndm hook while kdnsfilter is down: its sets still route.
 		if !cfg.NFQueue.ManageFirewall {
@@ -176,19 +186,24 @@ func firewallCmd(path, op, family string) error {
 		}
 		return ensureRouting(cfg, family)
 	case "remove":
-		firewall.Remove(append(rules, firewall.RoutingRules(cfg.Routing)...))
+		// What kdnsfilter undoes when it stops (init script, after a kill):
+		// the routing rules stay, the sets keep routing.
+		firewall.Remove(rules)
 		return nil
+	case "remove-all":
+		// Uninstall: also the routing rules, TPROXY chains and ip rules.
+		firewall.Remove(rules)
+		return firewall.ApplyRouting(cfg.Routing, config.Routing{}, "")
 	}
-	return fmt.Errorf("-firewall must be ensure, ensure-routing or remove, got %q", op)
+	return fmt.Errorf("-firewall must be ensure, ensure-routing, remove or remove-all, got %q", op)
 }
 
 func ensureRouting(cfg *config.Config, family string) error {
-	rr := firewall.RoutingRules(cfg.Routing)
-	if len(rr) == 0 {
+	if len(firewall.RoutingRules(cfg.Routing)) == 0 {
 		return nil
 	}
 	// A rule can't name a set that doesn't exist yet (e.g. at boot).
-	return errors.Join(ensureSets(cfg.Routing), firewall.Ensure(rr, family))
+	return errors.Join(ensureSets(cfg.Routing), firewall.ApplyRouting(config.Routing{}, cfg.Routing, family))
 }
 
 // ensureSets creates the routing lists' ipsets (existing ones are kept).
@@ -206,6 +221,40 @@ func ensureSets(rt config.Routing) error {
 			c.Create(v6, true, time.Duration(rt.MinTimeout), routing.MaxElem))
 	}
 	return errors.Join(errs...)
+}
+
+// setTProxyPort is for the installer: it points a routing list at a
+// proxy's TPROXY port without hand-editing the YAML.
+func setTProxyPort(path, list string, port int) error {
+	if port > 65535 {
+		return fmt.Errorf("-tproxy-port %d: want 0-65535", port)
+	}
+	cfg, err := loadOrCreate(path)
+	if err != nil {
+		return err
+	}
+	rt := &cfg.Routing
+	i := slices.IndexFunc(rt.Lists, func(l config.RouteList) bool { return l.Name == list })
+	if i < 0 {
+		rt.Lists = append(rt.Lists, config.RouteList{Name: list, Domains: []string{}})
+		i = len(rt.Lists) - 1
+	}
+	l := &rt.Lists[i]
+	if l.Chain != "" || l.OutputChain != "" {
+		return fmt.Errorf("routing list %q is routed by its own chains (chain/output_chain); remove them from %s first", list, path)
+	}
+	l.TProxyPort = uint16(port)
+	if port > 0 {
+		rt.Enabled = true
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if err := cfg.Save(path); err != nil {
+		return err
+	}
+	fmt.Printf("routing list %s: TPROXY port %d\n", list, port)
+	return nil
 }
 
 func importAdGuard(src, dst string, force bool) error {

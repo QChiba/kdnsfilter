@@ -52,8 +52,10 @@ func Rules(queue uint16, dests []netip.Prefix) []Rule {
 }
 
 // RoutingRules jumps from PREROUTING (forwarded traffic) and OUTPUT (the
-// router's own) to each list's chains for packets to its sets' members. The
-// chains belong to whoever routes the traffic (e.g. a proxy's own netfilter hooks).
+// router's own) to each list's chains for packets to its sets' members:
+// kdnsfilter's TPROXY chains for lists with a tproxy_port, otherwise the
+// list's own chains, which belong to whoever routes the traffic (e.g. a
+// proxy's own netfilter hooks).
 func RoutingRules(rt config.Routing) []Rule {
 	if !rt.Enabled {
 		return nil
@@ -61,7 +63,8 @@ func RoutingRules(rt config.Routing) []Rule {
 	var out []Rule
 	for _, l := range rt.Lists {
 		v4, v6 := l.SetNames()
-		for _, hook := range []struct{ from, to string }{{"PREROUTING", l.Chain}, {"OUTPUT", l.OutputChain}} {
+		pre, post := listChains(rt, l)
+		for _, hook := range []struct{ from, to string }{{"PREROUTING", pre}, {"OUTPUT", post}} {
 			if hook.to == "" {
 				continue
 			}
@@ -82,6 +85,32 @@ func Diff(prev, next []Rule) []Rule {
 	var out []Rule
 	for _, r := range prev {
 		if !keep[r.String()] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// listChains returns the chains a list's set rules jump to.
+func listChains(rt config.Routing, l config.RouteList) (pre, out string) {
+	if l.TProxyPort == 0 {
+		return l.Chain, l.OutputChain
+	}
+	pre, out = TProxyChainNames(l.TProxyPort)
+	if !rt.TProxy.Router {
+		out = ""
+	}
+	return pre, out
+}
+
+// only keeps the rules of one family; empty means all.
+func only(rules []Rule, family string) []Rule {
+	if family == "" {
+		return rules
+	}
+	var out []Rule
+	for _, r := range rules {
+		if r.Family == family {
 			out = append(out, r)
 		}
 	}
@@ -116,15 +145,26 @@ func Remove(rules []Rule) {
 }
 
 func run(family, op, chain string, spec []string) error {
-	args := append([]string{"-w", "-t", "mangle", op, chain}, spec...)
-	out, err := exec.Command(binary(family), args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
+	_, err := command(family, append([]string{"-w", "-t", "mangle", op, chain}, spec...)...)
+	return err
 }
 
-// binary prefers the firmware's iptables over Entware's.
+// runCmd runs a command and returns its combined output; tests replace it.
+var runCmd = func(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).CombinedOutput()
+}
+
+// command runs a tool found by binary; the error carries its output.
+func command(name string, args ...string) (string, error) {
+	out, err := runCmd(binary(name), args...)
+	if err != nil {
+		return string(out), fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}
+
+// binary prefers the firmware's tools over Entware's (KeeneticOS itself
+// ships none of iptables, ip and insmod; Entware provides them in /opt).
 func binary(name string) string {
 	for _, dir := range []string{"/usr/sbin/", "/sbin/", "/opt/sbin/"} {
 		if _, err := os.Stat(dir + name); err == nil {

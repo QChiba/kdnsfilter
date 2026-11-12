@@ -747,7 +747,7 @@ async function routing(main) {
       el('div', { class: 'toolbar' }, el('button', { class: 'primary', onclick: () => run(async () => {
         try { await api('PUT', '/api/routing', { enabled: enabled.checked, min_timeout: minTimeout.value() }); } finally { reload(); }
       }, 'Routing settings saved') }, 'Save'))),
-    data.lists.map(l => routeListCard(l, reload)),
+    data.lists.map(l => routeListCard(l, data, reload)),
     data.lists.length ? null : el('div', { class: 'card' },
       el('h3', {}, 'Create a list'),
       el('div', { class: 'toolbar' }, newName, el('button', { class: 'primary', onclick: () => run(async () => {
@@ -785,11 +785,44 @@ function scrollToLine(ta, line) {
   ta.scrollTop = Math.max(0, n * lh - ta.clientHeight / 3);
 }
 
-function routeListCard(l, reload) {
+// routeVia shows how a list's sets are routed: a TPROXY port kdnsfilter
+// wires up itself, or the user's own chains from the YAML config.
+function routeVia(l, data, markUnsaved) {
+  if (l.chain || l.output_chain) {
+    const box = el('p', { class: 'small' }, 'Routed by your own chains: ',
+      l.chain ? el('code', {}, 'PREROUTING → ' + l.chain) : null, l.chain && l.output_chain ? ', ' : null,
+      l.output_chain ? el('code', {}, 'OUTPUT → ' + l.output_chain) : null, ' (set in the YAML config).');
+    box.port = () => undefined;
+    return box;
+  }
+  const port = el('input', { id: 'route-port-' + l.name, type: 'number', min: 1, max: 65535, step: 1,
+    value: l.tproxy_port || '', placeholder: 'e.g. 12345', style: 'width:110px', 'aria-label': 'TPROXY port of ' + l.name });
+  port.addEventListener('input', markUnsaved);
+  const box = el('div', {},
+    el('div', { class: 'form-row' }, el('label', { for: port.id }, 'TPROXY port '), port,
+      el('span', { class: 'small' }, l.tproxy_port
+        ? `TCP and UDP to the sets go to 127.0.0.1:${l.tproxy_port} / [::1]:${l.tproxy_port} (mark ${data.tproxy.mark}, table ${data.tproxy.table})` +
+          (data.tproxy.router ? ', the router\'s own traffic too' : '')
+        : 'not set: the sets ' + l.set4 + ' / ' + l.set6 + ' are only filled, route them yourself')),
+    el('p', { class: 'small' }, 'The port your proxy (hysteria, sing-box, xray, mihomo…) listens on with TPROXY on the router. ',
+      'kdnsfilter adds the iptables chains, mark and routing table itself. Leave empty to route the sets with your own rules.'),
+    data.manage_firewall ? null : el('p', { class: 'error small' }, 'nfqueue.manage_firewall is off: kdnsfilter adds no firewall rules.'));
+  box.port = () => {
+    const v = port.value.trim();
+    if (v === '') return 0;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < 1 || n > 65535) throw new Error('TPROXY port must be 1-65535 or empty');
+    return n;
+  };
+  return box;
+}
+
+function routeListCard(l, data, reload) {
   const domains = el('textarea', { spellcheck: 'false', 'aria-label': 'Domains of ' + l.name }, l.domains.join('\n'));
   const routed = l.domains.filter(d => !d.startsWith('!')).length;
   const unsaved = el('span', { class: 'small', hidden: true }, 'Not saved yet');
   domains.addEventListener('input', () => { unsaved.hidden = false; });
+  const via = routeVia(l, data, () => { unsaved.hidden = false; });
   // A field for phones and tablets, where editing the textarea is awkward;
   // it changes the editor only, Save list still applies.
   const addInput = el('input', { id: 'route-add-' + l.name, type: 'text', inputmode: 'url', size: 30,
@@ -812,8 +845,9 @@ function routeListCard(l, reload) {
     toast(`Added ${fresh.join(', ')}. Press Save list to apply.`);
   };
   const save = () => run(async () => {
+    const tproxy_port = via.port(); // throws before anything is sent or reloaded
     try {
-      await api('PUT', '/api/routing/lists/' + encodeURIComponent(l.name), { domains: domains.value.split('\n') });
+      await api('PUT', '/api/routing/lists/' + encodeURIComponent(l.name), { domains: domains.value.split('\n'), tproxy_port });
     } finally { reload(); }
   }, `List ${l.name} saved; addresses devices already have are being added`);
   return el('div', { class: 'card' },
@@ -822,6 +856,7 @@ function routeListCard(l, reload) {
     el('p', { class: 'small' }, 'One domain per line; it covers all its subdomains. ',
       el('code', {}, '!sub.example.com'), ' excludes a subdomain. The list is sorted when saved. ',
       'Saving applies at once: removed domains stop being routed, added ones are routed from the answers devices already have.'),
+    via,
     el('form', { class: 'toolbar', onsubmit: add }, addInput, el('button', {}, 'Add')),
     domains,
     el('div', { class: 'toolbar', style: 'margin-top:8px' },

@@ -61,3 +61,46 @@ func TestLoadNormalizesRouting(t *testing.T) {
 		t.Errorf("%+v", r)
 	}
 }
+
+func TestTProxyValidate(t *testing.T) {
+	base := func() Routing {
+		r := Default().Routing
+		r.Lists = []RouteList{{Name: "bypass", TProxyPort: 12345, Domains: []string{"x.com"}}}
+		return r
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(*Routing)
+		want string
+	}{
+		{"ok", func(*Routing) {}, ""},
+		{"with chain", func(r *Routing) { r.Lists[0].Chain = "X" }, "not both"},
+		{"no mark", func(r *Routing) { r.TProxy.Mark = 0 }, "mark must not be 0"},
+		{"main table", func(r *Routing) { r.TProxy.Table = 254 }, "routing.tproxy.table"},
+		{"router loops", func(r *Routing) { r.TProxy.Router = true }, "would loop"},
+		{"router by group", func(r *Routing) { r.TProxy.Router, r.TProxy.ProxyGroup = true, "proxy" }, ""},
+		{"bad group", func(r *Routing) { r.TProxy.ProxyGroup = "a b" }, "proxy_group"},
+		{"same mark", func(r *Routing) { r.TProxy.ProxyMark = r.TProxy.Mark }, "must differ"},
+		// TPROXY settings don't matter while no list uses them.
+		{"unused", func(r *Routing) { r.Lists[0].TProxyPort, r.TProxy.Mark = 0, 0 }, ""},
+	} {
+		r := base()
+		tc.edit(&r)
+		err := r.Validate()
+		if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+			t.Errorf("%s: %v", tc.name, err)
+		}
+	}
+}
+
+func TestTProxyYAML(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "c.yaml")
+	os.WriteFile(p, []byte("routing:\n  enabled: true\n  tproxy:\n    mark: 0x1ff\n  lists:\n    - name: bypass\n      tproxy_port: 12345\n      domains: [x.com]\n"), 0o600)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Routing.TProxy.Mark != 0x1ff || c.Routing.TProxy.Table != DefaultTProxyTable || c.Routing.Lists[0].TProxyPort != 12345 {
+		t.Errorf("%+v", c.Routing)
+	}
+}

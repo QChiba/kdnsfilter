@@ -714,7 +714,11 @@ func (s *Server) routing(_ http.ResponseWriter, _ *http.Request) (any, error) {
 		"min_timeout":   rt.MinTimeout.String(),
 		"min_timeout_s": int64(time.Duration(rt.MinTimeout) / time.Second),
 		"lists":         lists,
-		"error":         lastErr,
+		"tproxy": map[string]any{
+			"mark": fmt.Sprintf("0x%x", rt.TProxy.Mark), "table": rt.TProxy.Table, "router": rt.TProxy.Router,
+		},
+		"manage_firewall": s.app.Config().NFQueue.ManageFirewall,
+		"error":           lastErr,
 	}, nil
 }
 
@@ -737,10 +741,11 @@ func (s *Server) setRouting(_ http.ResponseWriter, r *http.Request) (any, error)
 }
 
 // setRouteList replaces the domains of a list (one per line in the UI) and,
-// if given, its chains; a missing list is created.
+// if given, its TPROXY port or chains; a missing list is created.
 func (s *Server) setRouteList(_ http.ResponseWriter, r *http.Request) (any, error) {
 	var in struct {
 		Domains     []string `json:"domains"`
+		TProxyPort  *uint16  `json:"tproxy_port"`
 		Chain       *string  `json:"chain"`
 		OutputChain *string  `json:"output_chain"`
 	}
@@ -756,6 +761,9 @@ func (s *Server) setRouteList(_ http.ResponseWriter, r *http.Request) (any, erro
 		}
 		l := &c.Routing.Lists[i]
 		l.Domains = in.Domains
+		if in.TProxyPort != nil {
+			l.TProxyPort = *in.TProxyPort
+		}
 		if in.Chain != nil {
 			l.Chain = strings.TrimSpace(*in.Chain)
 		}

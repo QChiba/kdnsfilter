@@ -53,13 +53,14 @@ func withFakeKernel(t *testing.T) (*fakeSets, *[][2][]firewall.Rule) {
 	t.Helper()
 	f := &fakeSets{sets: map[string]map[netip.Addr]bool{}}
 	var applied [][2][]firewall.Rule
-	oldB, oldR := newRoutingBackend, applyRules
+	oldB, oldR := newRoutingBackend, applyRouting
 	newRoutingBackend = func() (routing.Backend, error) { return f, nil }
-	applyRules = func(remove, ensure []firewall.Rule) error {
-		applied = append(applied, [2][]firewall.Rule{remove, ensure})
+	applyRouting = func(prev, next config.Routing) error {
+		cur := firewall.RoutingRules(next)
+		applied = append(applied, [2][]firewall.Rule{firewall.Diff(firewall.RoutingRules(prev), cur), cur})
 		return nil
 	}
-	t.Cleanup(func() { newRoutingBackend, applyRules = oldB, oldR })
+	t.Cleanup(func() { newRoutingBackend, applyRouting = oldB, oldR })
 	return f, &applied
 }
 
