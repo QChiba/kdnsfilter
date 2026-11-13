@@ -48,6 +48,7 @@ type App struct {
 	Routing *routing.Router
 
 	mu     sync.Mutex                    // serialises config changes and rebuilds
+	rtMu   sync.Mutex                    // serialises routing/firewall application
 	cfg    atomic.Pointer[config.Config] // immutable snapshot, replaced by Update
 	status map[uint64]ListStatus
 	filter atomic.Pointer[filtering.Filter]
@@ -129,31 +130,41 @@ func clone(c *config.Config) *config.Config {
 }
 
 // Update applies fn to a copy of the config, validates, rebuilds the filter
-// and saves. Nothing changes if any step fails.
+// and saves. Nothing changes if any step fails: on a save error the previous
+// filter and rules stay in place, and the stored config still matches what
+// runs.
 func (a *App) Update(fn func(*config.Config) error) error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	prev := a.cfg.Load()
+	prevFilter, prevRules, prevKey := a.filter.Load(), a.rules, a.rulesKey
 	next := clone(prev)
 	if err := fn(next); err != nil {
+		a.mu.Unlock()
 		return err
 	}
 	for i := range next.Routing.Lists {
 		next.Routing.Lists[i].Normalize()
 	}
 	if err := next.Validate(); err != nil {
+		a.mu.Unlock()
 		return err
 	}
 	if err := a.rebuild(next); err != nil {
+		a.mu.Unlock()
 		return err
 	}
 	if err := next.Save(a.cfgPath); err != nil {
+		// The new filter must not outlive its config.
+		a.rules, a.rulesKey = prevRules, prevKey
+		a.filter.Store(prevFilter)
+		a.mu.Unlock()
 		return fmt.Errorf("save config: %w", err)
 	}
 	a.cfg.Store(next)
 	a.Log.Configure(next.QueryLog.Size, next.QueryLog.Enabled, time.Duration(next.QueryLog.Interval))
 	a.Stats.SetInterval(time.Duration(next.Stats.Interval))
 	a.safe.setAddr(next.Resolver)
+	a.mu.Unlock()
 	a.routingChanged(prev, next)
 	return nil
 }
@@ -375,8 +386,6 @@ func countRules(b []byte) int {
 	return n
 }
 
-// RunUpdater refreshes stale lists hourly (each list is refetched once its
-// copy is older than the update interval) and the services catalog daily.
 // Record logs and counts one decision.
 func (a *App) Record(e querylog.Entry) {
 	a.Log.Add(e)
@@ -416,6 +425,8 @@ func (a *App) Close() {
 	}
 }
 
+// RunUpdater refreshes stale lists hourly (each list is refetched once its
+// copy is older than the update interval) and the services catalog daily.
 func (a *App) RunUpdater(ctx context.Context) {
 	tick := time.NewTicker(time.Hour)
 	defer tick.Stop()

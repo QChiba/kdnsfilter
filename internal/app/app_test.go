@@ -127,6 +127,33 @@ func TestProcess(t *testing.T) {
 	}
 }
 
+// An allowlist exception for a site doesn't exempt the trackers it embeds:
+// a passing name whose CNAME target is blocked is blocked like AdGuard Home
+// does (the check used to run only for names with no rule of their own).
+func TestAllowlistDoesNotExemptCNAMETarget(t *testing.T) {
+	a := newTestApp(t, config.BlockNXDomain)
+	if err := a.Update(func(c *config.Config) error {
+		c.UserRules = append(c.UserRules, "@@||metrics.shop.example^")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dst := [4]byte{192, 168, 1, 50}
+	now := time.Now()
+
+	// Sanity: the allowlisted name itself passes.
+	if out, e := a.process(replyPacket(t, dst, "metrics.shop.example", dns.TypeA, "metrics.shop.example. 60 IN A 192.0.2.9"), now); out != nil || e.Action != "pass" || e.Reason != "allowlist" {
+		t.Fatalf("allowlist pass: out=%v entry=%+v", out != nil, e)
+	}
+	// ...but its CNAME to a blocked tracker is blocked.
+	out, e := a.process(replyPacket(t, dst, "metrics.shop.example", dns.TypeA,
+		"metrics.shop.example. 60 IN CNAME tracker.cloaked.",
+		"tracker.cloaked. 60 IN A 192.0.2.3"), now)
+	if out == nil || e.Action != "block" || e.CNAME != "tracker.cloaked" {
+		t.Fatalf("allowlisted name with blocked CNAME target: out=%v entry=%+v", out != nil, e)
+	}
+}
+
 func TestBlockingModes(t *testing.T) {
 	now := time.Now()
 	dst := [4]byte{192, 168, 1, 50}

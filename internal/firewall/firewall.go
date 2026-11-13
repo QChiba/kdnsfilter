@@ -145,7 +145,9 @@ func Remove(rules []Rule) {
 }
 
 func run(family, op, chain string, spec []string) error {
-	_, err := command(family, append([]string{"-w", "-t", "mangle", op, chain}, spec...)...)
+	// -w 5: don't wait forever on the xtables lock; an ndm rebuild holding
+	// it must not freeze kdnsfilter.
+	_, err := command(family, append([]string{"-w", "5", "-t", "mangle", op, chain}, spec...)...)
 	return err
 }
 

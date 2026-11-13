@@ -80,7 +80,7 @@ func rewriteReply(resp *dns.Msg, rw *filtering.Rewritten, addrs []netip.Addr, tt
 		switch {
 		case q.Qtype == dns.TypeA && a.Is4():
 			r.Answer = append(r.Answer, &dns.A{Hdr: hdr(owner, dns.TypeA, ttl), A: a.AsSlice()})
-		case q.Qtype == dns.TypeAAAA && a.Is6():
+		case q.Qtype == dns.TypeAAAA && a.Is6() && !a.Is4In6():
 			r.Answer = append(r.Answer, &dns.AAAA{Hdr: hdr(owner, dns.TypeAAAA, ttl), AAAA: a.AsSlice()})
 		}
 	}

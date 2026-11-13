@@ -6,5 +6,8 @@
 # shellcheck disable=SC2154 # set by ndm
 [ "$table" = "mangle" ] || exit 0
 op=ensure
-pidof kdnsfilter >/dev/null 2>&1 || op=ensure-routing
+# ndm's environment doesn't necessarily have /opt/bin in PATH, so don't
+# rely on bare pidof; the init script's pidfile is checked instead.
+PIDFILE=/opt/var/run/kdnsfilter.pid
+pid=$(cat "$PIDFILE" 2>/dev/null) && [ -d "/proc/$pid" ] || op=ensure-routing
 /opt/sbin/kdnsfilter -c /opt/etc/kdnsfilter/kdnsfilter.yaml -firewall $op -family "$type"

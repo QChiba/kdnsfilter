@@ -206,9 +206,11 @@ func (t TProxy) validate() error {
 		errs = append(errs, errors.New("routing.tproxy.mark must not be 0"))
 	}
 	// 0 and 253-255 are the kernel's unspec, default, main and local tables;
-	// table-1 is the priority of the rule in front of it.
-	if t.Table < 2 || (t.Table >= 253 && t.Table <= 255) || t.Table >= 32766 {
-		errs = append(errs, fmt.Errorf("routing.tproxy.table %d: want 2-32765 except 253-255", t.Table))
+	// table-1 is the priority of the rule in front of it. KeeneticOS's own
+	// ip rules start around priority 1000: the suppress_prefixlength rule
+	// must come before them, so tables beyond that are refused.
+	if t.Table < 2 || (t.Table >= 253 && t.Table <= 255) || t.Table >= 1000 {
+		errs = append(errs, fmt.Errorf("routing.tproxy.table %d: want 2-999 except 253-255 (the rules' priorities must stay below KeeneticOS's, ~1000)", t.Table))
 	}
 	if t.ProxyGroup != "" && !groupRe.MatchString(t.ProxyGroup) {
 		errs = append(errs, fmt.Errorf("routing.tproxy.proxy_group %q: want a group name or gid", t.ProxyGroup))

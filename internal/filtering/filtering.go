@@ -98,7 +98,10 @@ type Filter struct {
 	engine     *urlfilter.DNSEngine
 	services   map[string]*urlfilter.DNSEngine
 	clients    []clientMatcher
-	rewrites   *rewriteTable
+	// ids holds the $client identifier set of every named client, built
+	// once per snapshot so MatchRequest doesn't allocate per query.
+	ids      map[string]*container.SortedSliceSet[string]
+	rewrites *rewriteTable
 	// BlockingMode and BlockedTTL shape the replies to blocked queries.
 	BlockingMode string
 	BlockedTTL   uint32
@@ -157,6 +160,7 @@ func Compose(cfg *config.Config, r *Rules, cat *Catalog) (*Filter, error) {
 			pause:     cfg.Filtering.BlockedServices.Schedule,
 		},
 		services:     map[string]*urlfilter.DNSEngine{},
+		ids:          map[string]*container.SortedSliceSet[string]{},
 		rewrites:     buildRewrites(cfg.Filtering.Rewrites),
 		BlockingMode: cfg.Filtering.BlockingMode,
 		BlockedTTL:   cfg.Filtering.BlockedResponseTTL,
@@ -176,6 +180,9 @@ func Compose(cfg *config.Config, r *Rules, cat *Catalog) (*Filter, error) {
 			}
 		}
 		f.clients = append(f.clients, m)
+		if _, done := f.ids[c.Name]; !done {
+			f.ids[c.Name] = container.NewSortedSliceSet(c.Name)
+		}
 		if !c.UseGlobalBlockedServices {
 			used = append(used, c.BlockedServices.IDs...)
 		}
@@ -276,14 +283,12 @@ func (f *Filter) check(req Request, now time.Time, rewrite bool) Result {
 		return res
 	}
 
-	ids := container.NewSortedSliceSet[string]()
-	if s.name != "" {
-		ids = container.NewSortedSliceSet(s.name)
-	}
 	m, _ := f.engine.MatchRequest(&urlfilter.DNSRequest{
-		Hostname:          req.Host,
-		ClientIP:          req.ClientIP,
-		ClientIdentifiers: ids,
+		Hostname: req.Host,
+		ClientIP: req.ClientIP,
+		// nil (unnamed client) and per-snapshot sets avoid a heap
+		// allocation per query.
+		ClientIdentifiers: f.ids[s.name],
 		DNSType:           req.QType,
 	})
 	if rewrite {

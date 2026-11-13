@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -117,7 +118,7 @@ func TestStatsAndQuerylogEndpoints(t *testing.T) {
 	if len(page.Entries) != 2 || !page.More || page.NextBefore == nil {
 		t.Fatalf("first page: %+v", page)
 	}
-	resp, _ = http.Get(srv.URL + "/api/querylog?limit=2&before=" + page.NextBefore.Format(time.RFC3339Nano))
+	resp, _ = http.Get(srv.URL + "/api/querylog?limit=2&before=" + url.QueryEscape(page.NextBefore.Format(time.RFC3339Nano)))
 	var next querylogPage
 	json.NewDecoder(resp.Body).Decode(&next)
 	resp.Body.Close()

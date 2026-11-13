@@ -1,6 +1,11 @@
 // Package querylog records DNS decisions: the newest entries in a fixed-size
 // in-memory ring, and (when a retention is set) every entry in daily
 // JSON-lines files that are deleted once older than the retention.
+//
+// The ring is updated synchronously in Add, but the disk copy is written by
+// the Run goroutine: a reply must not wait for a marshal or a flash write.
+// Before Run has started (tests, or when the caller never starts it) Add
+// writes synchronously, so a log without Run behaves as a synchronous one.
 package querylog
 
 import (
@@ -9,11 +14,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,17 +46,37 @@ type Entry struct {
 
 const fileExt = ".jsonl"
 
+// chanLen is how many entries the writer may fall behind before Add starts
+// dropping the disk copy (the ring keeps them anyway). Only a flash stall
+// can fill this up.
+const chanLen = 256
+
 type Log struct {
-	mu        sync.Mutex
+	mu        sync.Mutex // ring and settings; locked before wmu everywhere
 	enabled   bool
 	buf       []Entry
 	next      int
 	full      bool
 	dir       string        // "" = memory only
 	retention time.Duration // 0 = memory only
-	f         *os.File
-	w         *bufio.Writer
-	fileDay   string
+
+	// Disk writing. When async (Run is running), Add hands entries to ch
+	// and the Run goroutine does the writes under wmu.
+	wmu     sync.Mutex
+	w       *os.File
+	bw      *bufio.Writer
+	fileDay string
+	async   bool
+	ch      chan queued
+	gen     uint64 // bumped by Clear/Configure: entries of older generations are dropped
+	dropped atomic.Uint64
+	idle    *sync.Cond // broadcast under mu whenever ch is empty
+}
+
+// queued pairs an entry with the generation it was recorded in.
+type queued struct {
+	e   Entry
+	gen uint64
 }
 
 // New creates a log keeping size entries in memory and, if dir and
@@ -58,15 +85,26 @@ func New(dir string, size int, enabled bool, retention time.Duration) *Log {
 	return &Log{buf: make([]Entry, max(size, 1)), enabled: enabled, dir: dir, retention: retention}
 }
 
+// Enabled reports whether entries are recorded at all; when it is false the
+// hot path can skip work that only the log consumes.
+func (l *Log) Enabled() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.enabled
+}
+
 // Configure applies new settings; resizing the ring drops its contents
 // (entries on disk are kept).
 func (l *Log) Configure(size int, enabled bool, retention time.Duration) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.enabled, l.retention = enabled, retention
 	if size = max(size, 1); size != len(l.buf) {
 		l.buf, l.next, l.full = make([]Entry, size), 0, false
 	}
+	l.gen++ // the writer drops entries queued for settings that no longer hold
+	ch := l.ch
+	l.mu.Unlock()
+	drain(ch)
 	if !l.persisting() {
 		l.closeFile()
 	}
@@ -76,8 +114,8 @@ func (l *Log) persisting() bool { return l.enabled && l.dir != "" && l.retention
 
 func (l *Log) Add(e Entry) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if !l.enabled {
+		l.mu.Unlock()
 		return
 	}
 	l.buf[l.next] = e
@@ -85,15 +123,33 @@ func (l *Log) Add(e Entry) {
 	if l.next == 0 {
 		l.full = true
 	}
+	var ch chan queued
+	gen := l.gen
 	if l.persisting() {
-		l.write(e)
+		if l.async {
+			ch = l.ch
+		} else {
+			// No writer goroutine: write here, briefly.
+			l.wmu.Lock()
+			l.write(e)
+			l.wmu.Unlock()
+		}
+	}
+	l.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- queued{e, gen}:
+		default:
+			l.dropped.Add(1)
+		}
 	}
 }
 
-// write appends e to its day's file. Errors only cost the disk copy.
+// write appends e to its day's file. Callers hold wmu. Errors only cost the
+// disk copy.
 func (l *Log) write(e Entry) {
 	day := e.Time.Format(time.DateOnly)
-	if day != l.fileDay || l.w == nil {
+	if day != l.fileDay || l.bw == nil {
 		l.closeFile()
 		if err := os.MkdirAll(l.dir, 0o755); err != nil {
 			return
@@ -102,49 +158,76 @@ func (l *Log) write(e Entry) {
 		if err != nil {
 			return
 		}
-		l.f, l.w, l.fileDay = f, bufio.NewWriterSize(f, 32<<10), day
+		l.w, l.bw, l.fileDay = f, bufio.NewWriterSize(f, 32<<10), day
 	}
 	b, err := json.Marshal(&e)
 	if err != nil {
 		return
 	}
-	l.w.Write(append(b, '\n'))
+	l.bw.Write(append(b, '\n'))
 }
 
+// closeFile flushes and closes the current file; callers hold wmu.
 func (l *Log) closeFile() {
-	if l.w != nil {
-		l.w.Flush()
-		l.f.Close()
-		l.f, l.w, l.fileDay = nil, nil, ""
+	if l.bw != nil {
+		l.bw.Flush()
+		l.w.Close()
+		l.w, l.bw, l.fileDay = nil, nil, ""
 	}
 }
 
-// Flush writes buffered entries to disk.
+// drain empties a queue without blocking.
+func drain(ch chan queued) {
+	if ch == nil {
+		return
+	}
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+// Flush waits until every recorded entry has been written to the day file
+// and flushed to the OS.
 func (l *Log) Flush() {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.w != nil {
-		l.w.Flush()
+	if l.async {
+		for len(l.ch) > 0 {
+			l.idle.Wait()
+		}
+	}
+	l.mu.Unlock()
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+	if l.bw != nil {
+		l.bw.Flush()
 	}
 }
 
 // Close flushes and closes the current file.
 func (l *Log) Close() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.Flush()
 	l.closeFile()
 }
 
 // Clear drops all entries, in memory and on disk.
 func (l *Log) Clear() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.closeFile()
+	l.gen++
 	l.buf, l.next, l.full = make([]Entry, len(l.buf)), 0, false
+	ch := l.ch
+	l.mu.Unlock()
+	drain(ch) // the writer discards other old-generation entries itself
+	l.closeFile()
+	l.mu.Lock()
 	var errs []error
 	for _, p := range l.files() {
 		errs = append(errs, os.Remove(p))
 	}
+	l.mu.Unlock()
 	return errors.Join(errs...)
 }
 
@@ -174,9 +257,17 @@ func (l *Log) files() []string {
 	return m
 }
 
-// Run flushes every few seconds and removes expired files hourly; it closes
-// the log when ctx ends.
+// Run writes queued entries to disk, flushes every few seconds and removes
+// expired files hourly; it closes the log when ctx ends. After Run, Add
+// hands entries to the writer instead of writing them itself.
 func (l *Log) Run(ctx context.Context) {
+	l.mu.Lock()
+	l.ch = make(chan queued, chanLen)
+	l.idle = sync.NewCond(&l.mu)
+	l.async = true
+	ch := l.ch
+	l.mu.Unlock()
+
 	flush := time.NewTicker(5 * time.Second)
 	clean := time.NewTicker(time.Hour)
 	defer flush.Stop()
@@ -188,9 +279,28 @@ func (l *Log) Run(ctx context.Context) {
 			l.Close()
 			return
 		case <-flush.C:
+			if n := l.dropped.Swap(0); n > 0 {
+				log.Printf("querylog: the disk writer fell behind, dropped %d entries", n)
+			}
 			l.Flush()
 		case t := <-clean.C:
 			l.Cleanup(t)
+		case it := <-ch:
+			l.mu.Lock()
+			ok := l.persisting() && it.gen == l.gen
+			l.mu.Unlock()
+			if !ok {
+				continue
+			}
+			l.wmu.Lock()
+			l.write(it.e)
+			l.wmu.Unlock()
+			// Wake a Flush waiting for the queue to drain.
+			l.mu.Lock()
+			if len(ch) == 0 {
+				l.idle.Broadcast()
+			}
+			l.mu.Unlock()
 		}
 	}
 }
@@ -225,6 +335,10 @@ func (l *Log) Find(q Query) Result {
 	if q.Limit <= 0 {
 		q.Limit = 100
 	}
+	// Entries not yet written may have already left a small ring; make sure
+	// the day files are current before scanning them.
+	l.Flush()
+
 	var res Result
 	full := func() bool { return len(res.Entries) >= q.Limit }
 
@@ -237,15 +351,11 @@ func (l *Log) Find(q Query) Result {
 		}
 		return !full()
 	})
-	if full() || l.dir == "" {
-		l.mu.Unlock()
-		return res.page(full())
-	}
-	if l.w != nil {
-		l.w.Flush()
-	}
 	files := l.files()
 	l.mu.Unlock()
+	if full() || l.dir == "" {
+		return res.page(full())
+	}
 
 	// The ring holds everything newer than its oldest entry; continue below
 	// that (or below the cursor, if older).
@@ -494,7 +604,7 @@ func matches(e *Entry, q Query) bool {
 			return false
 		}
 	}
-	return q.Search == "" || strings.Contains(e.Host, q.Search) ||
+	return q.Search == "" || strings.Contains(strings.ToLower(e.Host), q.Search) ||
 		strings.Contains(e.ClientIP, q.Search) || strings.Contains(strings.ToLower(e.ClientName), q.Search)
 }
 

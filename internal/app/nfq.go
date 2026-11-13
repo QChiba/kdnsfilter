@@ -19,8 +19,10 @@ import (
 )
 
 // RunQueue reads DNS replies from the NFQUEUE until ctx is cancelled.
-// Packets the filter can't handle are always accepted unchanged.
-func (a *App) RunQueue(ctx context.Context, queue uint16) error {
+// Packets the filter can't handle are always accepted unchanged. When bound
+// is non-nil it receives a value once the queue is open, so the caller can
+// install the firewall rules at the right time.
+func (a *App) RunQueue(ctx context.Context, queue uint16, bound chan<- struct{}) error {
 	nf, err := nfqueue.Open(&nfqueue.Config{
 		NfQueue:      queue,
 		MaxPacketLen: 0xffff,
@@ -33,12 +35,30 @@ func (a *App) RunQueue(ctx context.Context, queue uint16) error {
 		return fmt.Errorf("open nfqueue %d: %w", queue, err)
 	}
 	defer nf.Close()
+	if bound != nil {
+		select {
+		case bound <- struct{}{}:
+		default:
+		}
+	}
 	if err := nf.SetOption(netlink.NoENOBUFS, true); err != nil {
 		log.Printf("nfqueue: set NoENOBUFS: %v", err)
 	}
 
-	handle := func(attr nfqueue.Attribute) int {
-		id := *attr.PacketID
+	handle := func(attr nfqueue.Attribute) (ret int) {
+		var id uint32
+		if attr.PacketID != nil {
+			id = *attr.PacketID
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				// A panic here would kill the whole filter; accept the
+				// original packet instead (a second verdict for an already
+				// released packet just fails, which is fine).
+				log.Printf("nfqueue handler: recovered: %v", r)
+				nf.SetVerdict(id, nfqueue.NfAccept)
+			}
+		}()
 		var out []byte
 		if attr.Payload != nil {
 			var e *querylog.Entry
@@ -54,7 +74,12 @@ func (a *App) RunQueue(ctx context.Context, queue uint16) error {
 			verr = nf.SetVerdict(id, nfqueue.NfAccept)
 		}
 		if verr != nil {
-			log.Printf("nfqueue verdict: %v", verr)
+			// Without a verdict (e.g. ENOBUFS under load) the kernel would
+			// keep the packet queued forever; accept the original packet
+			// instead, which is strictly better than losing the reply.
+			if aerr := nf.SetVerdict(id, nfqueue.NfAccept); aerr != nil {
+				log.Printf("nfqueue verdict: %v (accept fallback: %v)", verr, aerr)
+			}
 		}
 		return 0
 	}
@@ -91,7 +116,10 @@ func (a *App) process(raw []byte, now time.Time) ([]byte, *querylog.Entry) {
 	f := a.Filter()
 	res := f.Check(req, now)
 	var cname string
-	if res.Action == filtering.Pass && res.Reason == "" {
+	// The CNAME targets are checked for every passing answer, also when the
+	// queried name matched an allowlist rule: like AdGuard Home, an
+	// exception for a site doesn't exempt the trackers it embeds.
+	if res.Action == filtering.Pass {
 		for _, rr := range m.Answer {
 			c, ok := rr.(*dns.CNAME)
 			if !ok {
@@ -162,7 +190,9 @@ func (a *App) process(raw []byte, now time.Time) ([]byte, *querylog.Entry) {
 		e.Route, e.RouteEntry, e.RouteVia = rt.List, rt.Entry, rt.Via
 	}
 	e.Rcode = dns.RcodeToString[final.Rcode]
-	e.Answers = summarize(final.Answer)
+	if a.Log.Enabled() { // only the query log reads the answers
+		e.Answers = summarize(final.Answer)
+	}
 
 	var out []byte
 	if final != &m {
@@ -180,21 +210,34 @@ func (a *App) process(raw []byte, now time.Time) ([]byte, *querylog.Entry) {
 
 func summarize(rrs []dns.RR) []string {
 	var out []string
+	truncated := false
 	for _, rr := range rrs {
-		switch v := rr.(type) {
-		case *dns.A:
-			out = append(out, v.A.String())
-		case *dns.AAAA:
-			out = append(out, v.AAAA.String())
-		case *dns.CNAME:
-			out = append(out, "CNAME "+strings.TrimSuffix(v.Target, "."))
-		case *dns.HTTPS:
-			out = append(out, "HTTPS")
+		s, ok := summarizeRR(rr)
+		if !ok {
+			continue
 		}
 		if len(out) == 8 {
-			out = append(out, "…")
+			truncated = true
 			break
 		}
+		out = append(out, s)
+	}
+	if truncated {
+		out = append(out, "…")
 	}
 	return out
+}
+
+func summarizeRR(rr dns.RR) (string, bool) {
+	switch v := rr.(type) {
+	case *dns.A:
+		return v.A.String(), true
+	case *dns.AAAA:
+		return v.AAAA.String(), true
+	case *dns.CNAME:
+		return "CNAME " + strings.TrimSuffix(v.Target, "."), true
+	case *dns.HTTPS:
+		return "HTTPS", true
+	}
+	return "", false
 }

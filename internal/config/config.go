@@ -15,6 +15,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/QChiba/kdnsfilter/internal/disk"
 	"github.com/QChiba/kdnsfilter/internal/schedule"
 )
 
@@ -179,20 +180,16 @@ func Load(path string) (*Config, error) {
 	return c, c.Validate()
 }
 
-// Save writes the config atomically.
+// Save writes the config atomically and durably (synced before the rename).
 func (c *Config) Save(path string) error {
 	b, err := yaml.Marshal(c)
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return disk.Write(path, b, 0o600)
 }
 
 func (c *Config) Validate() error {

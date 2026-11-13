@@ -44,11 +44,15 @@ func newRouter(cfg *config.Config) *routing.Router {
 
 // routingChanged applies a changed routing config: sets, entries, the
 // firewall rules (when kdnsfilter manages the firewall) and a prefill of
-// the domains just added. Callers hold a.mu.
+// the domains just added. It runs outside a.mu (the firewall work can block
+// on the xtables lock) and is serialized by rtMu so the prev→next diffs are
+// applied in Update order.
 func (a *App) routingChanged(prev, next *config.Config) {
 	if reflect.DeepEqual(prev.Routing, next.Routing) {
 		return
 	}
+	a.rtMu.Lock()
+	defer a.rtMu.Unlock()
 	added := a.Routing.Configure(next.Routing, time.Now())
 	if next.NFQueue.ManageFirewall {
 		if err := applyRouting(prev.Routing, next.Routing); err != nil {

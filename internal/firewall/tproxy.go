@@ -50,6 +50,9 @@ type PolicyRoute struct {
 var (
 	QueueModules  = []string{"nfnetlink_queue", "xt_NFQUEUE"}
 	TProxyModules = []string{"xt_socket", "xt_TPROXY"}
+	// SetModules are needed by every routing list (the ipset netlink
+	// backend and the "-m set" match), not only the TPROXY ones.
+	SetModules = []string{"ip_set", "xt_set"}
 )
 
 var families = []string{"iptables", "ip6tables"}
@@ -133,6 +136,11 @@ func PolicyRoutes(rt config.Routing) []PolicyRoute {
 // (uninstall). family limits the work to one family; empty means both.
 func ApplyRouting(prev, next config.Routing, family string) error {
 	var errs []error
+	if len(RoutingRules(next)) > 0 {
+		// Every routing jump matches a set: without ip_set/xt_set the rules
+		// fail at iptables (and the netlink backend at ipset).
+		errs = append(errs, LoadModules(SetModules...))
+	}
 	if len(tproxyPorts(next)) > 0 {
 		errs = append(errs, LoadModules(TProxyModules...))
 	}
@@ -179,7 +187,7 @@ func pruneTProxy(jumps []Rule, chains []Chain, family string) {
 		if family != "" && fam != family {
 			continue
 		}
-		out, err := command(fam, "-w", "-t", "mangle", "-S")
+		out, err := command(fam, "-w", "5", "-t", "mangle", "-S")
 		if err != nil {
 			continue
 		}
@@ -223,7 +231,7 @@ func ensureChain(c Chain) error {
 }
 
 func chainMatches(c Chain) bool {
-	out, err := command(c.Family, "-w", "-t", "mangle", "-S", c.Name)
+	out, err := command(c.Family, "-w", "5", "-t", "mangle", "-S", c.Name)
 	if err != nil {
 		return false
 	}
