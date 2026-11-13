@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/QChiba/kdnsfilter/internal/config"
 )
@@ -145,11 +146,23 @@ func Remove(rules []Rule) {
 }
 
 func run(family, op, chain string, spec []string) error {
-	// -w 5: don't wait forever on the xtables lock; an ndm rebuild holding
-	// it must not freeze kdnsfilter.
-	_, err := command(family, append([]string{"-w", "5", "-t", "mangle", op, chain}, spec...)...)
+	// -w: don't wait forever on the xtables lock; an ndm rebuild holding it
+	// must not freeze kdnsfilter. "-w 5" (bounded wait, iptables ≥ 1.6.2)
+	// where supported, bare "-w" on older builds like Entware's 1.4.21 for
+	// Keenetic, where a separate value is a bad argument.
+	args := append(append([]string{}, waitArgs()...), "-t", "mangle", op, chain)
+	_, err := command(family, append(args, spec...)...)
 	return err
 }
+
+// waitArgs returns the xtables-lock wait arguments the local iptables
+// supports, probing once ("-w 5" needs iptables ≥ 1.6.2).
+var waitArgs = sync.OnceValue(func() []string {
+	if _, err := runCmd(binary("iptables"), "-w", "5", "-t", "mangle", "-S"); err == nil {
+		return []string{"-w", "5"}
+	}
+	return []string{"-w"}
+})
 
 // runCmd runs a command and returns its combined output; tests replace it.
 var runCmd = func(name string, args ...string) ([]byte, error) {

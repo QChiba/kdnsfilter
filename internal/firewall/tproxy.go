@@ -187,7 +187,7 @@ func pruneTProxy(jumps []Rule, chains []Chain, family string) {
 		if family != "" && fam != family {
 			continue
 		}
-		out, err := command(fam, "-w", "5", "-t", "mangle", "-S")
+		out, err := command(fam, append(append([]string{}, waitArgs()...), "-t", "mangle", "-S")...)
 		if err != nil {
 			continue
 		}
@@ -231,7 +231,7 @@ func ensureChain(c Chain) error {
 }
 
 func chainMatches(c Chain) bool {
-	out, err := command(c.Family, "-w", "5", "-t", "mangle", "-S", c.Name)
+	out, err := command(c.Family, append(append([]string{}, waitArgs()...), "-t", "mangle", "-S", c.Name)...)
 	if err != nil {
 		return false
 	}
