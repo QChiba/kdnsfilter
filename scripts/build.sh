@@ -37,7 +37,9 @@ if [ -n "$PACKAGE" ]; then
 		cp "kdnsfilter-linux-$arch" pkg/kdnsfilter
 		cp ../dist/S80kdnsfilter ../dist/50-kdnsfilter.sh pkg/
 		echo "$VERSION" > pkg/VERSION
-		tar -czf "kdnsfilter_linux_$arch.tar.gz" --owner=0 --group=0 -C pkg .
+		# Deterministic bytes: gzip -n drops the timestamp, tar sorts and
+		# zeroes metadata, so a rebuilt release hashes identically.
+		tar --sort=name --mtime='@0' --owner=0 --group=0 -cf - -C pkg . | gzip -n > "kdnsfilter_linux_$arch.tar.gz"
 	done
 	rm -rf pkg
 	sha256sum kdnsfilter_linux_*.tar.gz > SHA256SUMS

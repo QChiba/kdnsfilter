@@ -37,7 +37,14 @@ func withFakeKernel(t *testing.T) *fakeKernel {
 		k.cmds = append(k.cmds, base+" "+strings.Join(args, " "))
 		switch base {
 		case "iptables", "ip6tables":
-			if len(args) == 4 && args[3] == "-S" { // the whole mangle table
+			// Commands look like -w 5 -t mangle <op> <chain> <spec...> or
+			// -w 5 -t mangle -S (the whole table).
+			i := slices.Index(args, "-t")
+			if i < 0 || i+1 >= len(args) {
+				return nil, errors.New("no table")
+			}
+			rest := args[i+2:]
+			if len(rest) == 1 && rest[0] == "-S" { // the whole mangle table
 				var out string
 				for key := range k.chains {
 					if fam, name, _ := strings.Cut(key, " "); fam == base {
@@ -51,7 +58,7 @@ func withFakeKernel(t *testing.T) *fakeKernel {
 				}
 				return []byte(out), nil
 			}
-			op, chain, spec := args[3], args[4], strings.Join(args[5:], " ")
+			op, chain, spec := rest[0], rest[1], strings.Join(rest[2:], " ")
 			key := base + " " + chain
 			switch {
 			case strings.HasPrefix(chain, "KDF_"):
@@ -224,7 +231,7 @@ func TestApplyRouting(t *testing.T) {
 	if err := ApplyRouting(config.Routing{}, rt, "iptables"); err != nil {
 		t.Fatal(err)
 	}
-	if k.ran("iptables -w -t mangle -A") != 0 || k.ran("iptables -w -t mangle -F") != 0 || k.ran("ip6tables") != 0 || k.ran("ip -4 rule add") != 0 {
+	if k.ran("iptables -w 5 -t mangle -A") != 0 || k.ran("iptables -w 5 -t mangle -F") != 0 || k.ran("ip6tables -w 5") != 0 || k.ran("ip -4 rule add") != 0 {
 		t.Errorf("idempotent run changed things: %v", k.cmds)
 	}
 

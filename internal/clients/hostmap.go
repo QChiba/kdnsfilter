@@ -108,20 +108,33 @@ func (m *HostMap) refresh() {
 	if fresh {
 		return
 	}
+	st, err := os.Stat(m.path)
+	if err != nil {
+		// Don't retry sooner than refreshEvery even on errors.
+		m.mu.Lock()
+		m.checked = time.Now()
+		m.mu.Unlock()
+		return
+	}
+	// Read and parse without holding the write lock: Lookup runs on the DNS
+	// reply path and must never wait for a file read.
+	var parsed map[netip.Addr]Host
+	var modTime time.Time
+	if !st.ModTime().Equal(m.modTime) {
+		f, err := os.Open(m.path)
+		if err == nil {
+			parsed = Parse(f)
+			f.Close()
+			modTime = st.ModTime()
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.checked = time.Now()
-	st, err := os.Stat(m.path)
-	if err != nil || st.ModTime().Equal(m.modTime) {
-		return
+	if parsed != nil {
+		m.byIP = parsed
+		m.modTime = modTime
 	}
-	f, err := os.Open(m.path)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	m.byIP = Parse(f)
-	m.modTime = st.ModTime()
 }
 
 // Parse reads lines like

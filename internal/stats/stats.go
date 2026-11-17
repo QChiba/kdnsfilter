@@ -8,14 +8,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/QChiba/kdnsfilter/internal/disk"
 )
 
-// keepTop is how many entries per top list a finished day keeps.
-const keepTop = 100
+// keepTop is how many entries per top list a day keeps. A day in progress is
+// trimmed once its lists reach trimAt, so its maps (and the lock the DNS
+// reply path takes to update them) stay bounded too; the totals in the hour
+// buckets stay exact.
+const (
+	keepTop = 100
+	trimAt  = 4 * keepTop
+)
 
 type hour struct {
 	Start   int64  `json:"start"` // unix seconds, start of the hour
@@ -112,21 +120,11 @@ func (s *Stats) Add(t time.Time, host, clientIP, clientName string, blocked bool
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	h := t.Truncate(time.Hour).Unix()
-	if n := len(s.hours); n == 0 || s.hours[n-1].Start < h {
-		s.hours = append(s.hours, hour{Start: h})
-	}
-	hr := &s.hours[len(s.hours)-1]
+	hr := s.hourBucket(h)
 	hr.Total++
 
 	ds := midnight(t)
-	if n := len(s.days); n == 0 || s.days[n-1].Start < ds {
-		if n > 0 {
-			s.days[n-1].trim()
-		}
-		s.days = append(s.days, newDay(ds))
-		s.expire(t)
-	}
-	d := s.days[len(s.days)-1]
+	d := s.dayBucket(ds)
 	d.Queried[host]++
 	d.Clients[clientIP]++
 	if clientName != "" {
@@ -139,10 +137,62 @@ func (s *Stats) Add(t time.Time, host, clientIP, clientName string, blocked bool
 			d.Services[service]++
 		}
 	}
+	if len(d.Queried) > trimAt || len(d.Clients) > trimAt {
+		d.trim()
+	}
 	s.dirty = true
 }
 
-// expire drops hours and days that ended before the retention window.
+// hourBucket returns the bucket of hour h, creating it if needed. The
+// buckets are kept ascending; a clock stepping back (NTP after boot) inserts
+// instead of misattributing to the newest bucket.
+func (s *Stats) hourBucket(h int64) *hour {
+	n := len(s.hours)
+	if n > 0 {
+		last := &s.hours[n-1]
+		switch {
+		case last.Start == h:
+			return last
+		case last.Start < h:
+			s.hours = append(s.hours, hour{Start: h})
+			return &s.hours[n]
+		}
+	}
+	i, _ := slices.BinarySearchFunc(s.hours, h, func(x hour, y int64) int { return int(x.Start - y) })
+	if i < len(s.hours) && s.hours[i].Start == h {
+		return &s.hours[i]
+	}
+	s.hours = slices.Insert(s.hours, i, hour{Start: h})
+	return &s.hours[i]
+}
+
+// dayBucket returns the day of local midnight ds, creating it if needed. A
+// day finishing at the end is trimmed and expired, as before.
+func (s *Stats) dayBucket(ds int64) *day {
+	n := len(s.days)
+	if n > 0 {
+		last := s.days[n-1]
+		switch {
+		case last.Start == ds:
+			return last
+		case last.Start < ds:
+			last.trim()
+			d := newDay(ds)
+			s.days = append(s.days, d)
+			s.expire(time.Now())
+			return d
+		}
+	}
+	i, _ := slices.BinarySearchFunc(s.days, ds, func(x *day, y int64) int { return int(x.Start - y) })
+	if i < len(s.days) && s.days[i].Start == ds {
+		return s.days[i]
+	}
+	s.days = slices.Insert(s.days, i, newDay(ds))
+	return s.days[i]
+}
+
+// expire drops hours and days that ended before the retention window, and
+// the names of clients they no longer mention.
 func (s *Stats) expire(now time.Time) {
 	cut := now.Add(-s.interval).Unix()
 	i := 0
@@ -155,6 +205,19 @@ func (s *Stats) expire(now time.Time) {
 		j++
 	}
 	s.days = s.days[j:]
+	if len(s.names) > 0 {
+		keep := map[string]bool{}
+		for _, d := range s.days {
+			for ip := range d.Clients {
+				keep[ip] = true
+			}
+		}
+		for ip := range s.names {
+			if !keep[ip] {
+				delete(s.names, ip)
+			}
+		}
+	}
 }
 
 // Reset clears everything.
@@ -162,6 +225,34 @@ func (s *Stats) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hours, s.days, s.names, s.dirty = nil, nil, map[string]string{}, true
+}
+
+// snapshot copies the current state so it can be marshaled or aggregated
+// without holding the mutex on the DNS reply path.
+func (s *Stats) snapshot() persisted {
+	hours := slices.Clone(s.hours)
+	days := make([]*day, len(s.days))
+	for i, d := range s.days {
+		c := *d
+		c.Queried = cloneCounts(d.Queried)
+		c.Blocked = cloneCounts(d.Blocked)
+		c.Clients = cloneCounts(d.Clients)
+		c.Services = cloneCounts(d.Services)
+		days[i] = &c
+	}
+	names := make(map[string]string, len(s.names))
+	for k, v := range s.names {
+		names[k] = v
+	}
+	return persisted{Hours: hours, Days: days, Names: names}
+}
+
+func cloneCounts(m map[string]uint64) map[string]uint64 {
+	out := make(map[string]uint64, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 type Count struct {
@@ -192,13 +283,15 @@ type Summary struct {
 // daily beyond. Top lists cover the days overlapping the window.
 func (s *Stats) Summary(now time.Time, n int) Summary {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.expire(now)
-	sum := Summary{Interval: fmtInterval(s.interval)}
-	start := now.Add(-s.interval)
+	snap, interval := s.snapshot(), s.interval
+	s.mu.Unlock()
+
+	sum := Summary{Interval: fmtInterval(interval)}
+	start := now.Add(-interval)
 	sum.Since = start
 
-	byDay := s.interval > 48*time.Hour
+	byDay := interval > 48*time.Hour
 	sum.BucketSize = "hour"
 	// The first bucket is the (partial) hour/day the window starts in, so the
 	// buckets add up to the totals.
@@ -218,7 +311,7 @@ func (s *Stats) Summary(now time.Time, n int) Summary {
 		idx[k] = len(sum.Buckets)
 		sum.Buckets = append(sum.Buckets, Bucket{Time: time.Unix(k, 0)})
 	}
-	for _, h := range s.hours {
+	for _, h := range snap.Hours {
 		k := h.Start
 		if byDay {
 			k = midnight(time.Unix(h.Start, 0))
@@ -232,7 +325,7 @@ func (s *Stats) Summary(now time.Time, n int) Summary {
 	}
 
 	queried, blocked, clients, services := map[string]uint64{}, map[string]uint64{}, map[string]uint64{}, map[string]uint64{}
-	for _, d := range s.days {
+	for _, d := range snap.Days {
 		add(queried, d.Queried)
 		add(blocked, d.Blocked)
 		add(clients, d.Clients)
@@ -240,7 +333,7 @@ func (s *Stats) Summary(now time.Time, n int) Summary {
 	}
 	sum.TopQueried, sum.TopBlocked, sum.TopServices = top(queried, n), top(blocked, n), top(services, n)
 	for _, c := range top(clients, n) {
-		if name := s.names[c.Name]; name != "" {
+		if name := snap.Names[c.Name]; name != "" {
 			c.Name = name + " (" + c.Name + ")"
 		}
 		sum.TopClients = append(sum.TopClients, c)
@@ -271,7 +364,9 @@ func top(m map[string]uint64, n int) []Count {
 	return out
 }
 
-// Save writes the statistics if they changed since the last save.
+// Save writes the statistics if they changed since the last save. The write
+// happens without the mutex; adds during it set dirty again and are saved by
+// the next call.
 func (s *Stats) Save() error {
 	if s.path == "" {
 		return nil
@@ -281,20 +376,19 @@ func (s *Stats) Save() error {
 		s.mu.Unlock()
 		return nil
 	}
-	b, err := json.Marshal(persisted{Hours: s.hours, Days: s.days, Names: s.names})
-	s.dirty = false
+	snap := s.snapshot()
 	s.mu.Unlock()
+	b, err := json.Marshal(snap)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+	if err := disk.Write(s.path, b, 0o644); err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
+	s.mu.Lock()
+	s.dirty = false
+	s.mu.Unlock()
+	return nil
 }
 
 // fmtInterval prints 168h as "7d".

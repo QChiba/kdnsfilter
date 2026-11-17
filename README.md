@@ -196,8 +196,8 @@ iptables -t mangle -A POSTROUTING -p udp --sport 53 ! -o lo -j NFQUEUE --queue-n
 
 ndm rebuilds its tables on many events; `dist/50-kdnsfilter.sh` (installed to
 `/opt/etc/ndm/netfilter.d/`) re-adds kdnsfilter's rules. kdnsfilter loads the
-kernel modules it needs (`nfnetlink_queue`, `xt_NFQUEUE`, and for TPROXY
-`xt_socket`, `xt_TPROXY`) itself.
+kernel modules it needs (`nfnetlink_queue`, `xt_NFQUEUE`; for routing also
+`ip_set`, `xt_set`; for TPROXY additionally `xt_socket`, `xt_TPROXY`) itself.
 
 Command line, for scripts: `-version`, `-import-adguard <AdGuardHome.yaml>`,
 `-tproxy-port <port> [-list <name>]` (sets a list's TPROXY port and enables

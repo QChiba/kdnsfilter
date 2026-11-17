@@ -9,7 +9,10 @@ PIDFILE=/opt/var/run/kdnsfilter.pid
 PATH=/opt/sbin:/opt/bin:/opt/usr/sbin:/opt/usr/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 running() {
-	[ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+	# The pidfile must name a running kdnsfilter: after a crash+reboot a
+	# recycled PID must not be mistaken for the service (stop would kill it).
+	pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
+	[ -n "$pid" ] && [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = kdnsfilter ]
 }
 
 start() {
@@ -25,7 +28,8 @@ start() {
 
 stop() {
 	if ! running; then echo "kdnsfilter not running"; rm -f "$PIDFILE"; return 0; fi
-	kill "$(cat "$PIDFILE")"
+	pid=$(cat "$PIDFILE")
+	kill "$pid"
 	for _ in 1 2 3 4 5; do running || break; sleep 1; done
 	running && kill -9 "$(cat "$PIDFILE")"
 	rm -f "$PIDFILE"

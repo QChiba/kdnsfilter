@@ -137,7 +137,14 @@ func (s *Server) allowedHost(hostport string) bool {
 		strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".lan") || strings.HasSuffix(host, ".home") {
 		return true
 	}
-	return slices.Contains(s.app.Config().HTTP.AllowedHosts, host)
+	// AllowedHosts entries are compared like the request host: lower case,
+	// without a trailing dot.
+	for _, h := range s.app.Config().HTTP.AllowedHosts {
+		if strings.ToLower(strings.TrimSuffix(strings.Trim(h, "[]"), ".")) == host {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) guard(next http.HandlerFunc) http.Handler {
@@ -229,7 +236,10 @@ func (s *Server) querylog(_ http.ResponseWriter, r *http.Request) (any, error) {
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	var before time.Time
 	if v := q.Get("before"); v != "" {
-		t, err := time.Parse(time.RFC3339Nano, v)
+		// A "+" in the timezone offset arrives as a space in a query string
+		// (script and curl users forget to escape it; URLSearchParams
+		// doesn't) — it can only be a positive UTC offset there.
+		t, err := time.Parse(time.RFC3339Nano, strings.ReplaceAll(v, " ", "+"))
 		if err != nil {
 			return nil, fmt.Errorf("before: %w", err)
 		}
@@ -324,10 +334,13 @@ func (s *Server) updateFilter(_ http.ResponseWriter, r *http.Request) (any, erro
 	err = s.app.Update(func(c *config.Config) error {
 		for i := range c.Filters {
 			if c.Filters[i].ID == id {
-				c.Filters[i].Name, c.Filters[i].Enabled = strings.TrimSpace(in.Name), in.Enabled
 				if u := strings.TrimSpace(in.URL); u != "" {
+					if !strings.HasPrefix(u, "https://") && !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "/") {
+						return errors.New("URL must be http(s):// or an absolute path")
+					}
 					c.Filters[i].URL = u
 				}
+				c.Filters[i].Name, c.Filters[i].Enabled = strings.TrimSpace(in.Name), in.Enabled
 				return nil
 			}
 		}

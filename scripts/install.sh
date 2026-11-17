@@ -37,6 +37,10 @@ have() { command -v "$1" >/dev/null 2>&1; }
 TPROXY_PORT='' VERSION='' FILE='' START=1 UNINSTALL='' PURGE=''
 while [ $# -gt 0 ]; do
 	case "$1" in
+	--tproxy-port | --version | --file)
+		[ -n "${2:-}" ] || die "option $1 needs a value" ;;
+	esac
+	case "$1" in
 	--tproxy-port) TPROXY_PORT=$2; shift ;;
 	--version) VERSION=$2; shift ;;
 	--file) FILE=$2; shift ;;
@@ -55,18 +59,18 @@ done
 [ -w /opt ] || die "run me as root"
 if [ -n "$TPROXY_PORT" ]; then
 	case "$TPROXY_PORT" in *[!0-9]* | '') die "--tproxy-port wants a number" ;; esac
-	[ "$TPROXY_PORT" -ge 1 ] && [ "$TPROXY_PORT" -le 65535 ] || die "--tproxy-port wants 1-65535"
+	if [ "$TPROXY_PORT" -lt 1 ] || [ "$TPROXY_PORT" -gt 65535 ]; then die "--tproxy-port wants 1-65535"; fi
 fi
 
 stop_service() {
-	[ -x "$INIT" ] && "$INIT" stop || true
+	if [ -x "$INIT" ]; then "$INIT" stop || true; fi
 }
 
 if [ -n "$UNINSTALL" ]; then
 	stop_service
 	# Routing rules, TPROXY chains and ip rules stay when the service stops
 	# (so routing survives restarts); take them out too.
-	[ -x "$BIN" ] && [ -f "$CONF" ] && "$BIN" -c "$CONF" -firewall remove-all || true
+	if [ -x "$BIN" ] && [ -f "$CONF" ]; then "$BIN" -c "$CONF" -firewall remove-all || true; fi
 	if have ipset; then
 		for s in $(ipset list -n 2>/dev/null | grep '^kdf_'); do ipset destroy "$s" 2>/dev/null || true; done
 	fi
@@ -124,9 +128,11 @@ for m in xt_NFQUEUE nfnetlink_queue; do
 		die "kernel module $m is missing: add the \"Netfilter subsystem kernel modules\" component in KeeneticOS (General settings → Component options) and reboot"
 done
 if [ -n "$TPROXY_PORT" ]; then
-	for m in xt_TPROXY xt_socket; do
+	# ip_set/xt_set are needed by every routing list (the "-m set" match),
+	# xt_TPROXY/xt_socket by the TPROXY chains.
+	for m in ip_set xt_set xt_TPROXY xt_socket; do
 		grep -q "^$m " /proc/modules || [ -f "$MODDIR/$m.ko" ] ||
-			say "warning: kernel module $m is missing, TPROXY routing will not work"
+			say "warning: kernel module $m is missing, routing will not work"
 	done
 fi
 
@@ -145,12 +151,15 @@ else
 	fi
 	say "downloading $URL/$ASSET"
 	curl -fL --retry 3 --connect-timeout 20 -o "$TMP/$ASSET" "$URL/$ASSET" || die "download failed"
-	if curl -fsL --retry 3 --connect-timeout 20 -o "$TMP/SHA256SUMS" "$URL/SHA256SUMS" && have sha256sum; then
-		(cd "$TMP" && grep " $ASSET\$" SHA256SUMS | sha256sum -c - >/dev/null 2>&1) || die "checksum mismatch for $ASSET"
-		say "checksum ok"
-	else
-		say "warning: checksum not verified"
-	fi
+	# A downloaded binary is executed as root, so its checksum is mandatory:
+	# no SHA256SUMS entry (or no sha256sum at all) is a failure, not a warning.
+	have sha256sum || die "sha256sum is missing (opkg install busybox or coreutils)"
+	curl -fsL --retry 3 --connect-timeout 20 -o "$TMP/SHA256SUMS" "$URL/SHA256SUMS" ||
+		die "can't download SHA256SUMS"
+	# grep must match: busybox's sha256sum -c on empty input exits 0.
+	grep " $ASSET\$" "$TMP/SHA256SUMS" > "$TMP/SUM" || die "SHA256SUMS has no entry for $ASSET"
+	(cd "$TMP" && sha256sum -c SUM >/dev/null 2>&1) || die "checksum mismatch for $ASSET"
+	say "checksum ok"
 fi
 mkdir "$TMP/pkg"
 tar -xzf "$TMP/$ASSET" -C "$TMP/pkg" || die "can't unpack $ASSET"
@@ -174,13 +183,20 @@ else
 fi
 
 # The config is created with defaults on the first start; -tproxy-port
-# creates it now if needed and only changes the routing list.
+# creates it now if needed and only changes the routing list. Filtering
+# doesn't depend on routing, so a failure here (e.g. the list already uses
+# its own chains) must not leave the service stopped: warn and go on.
 if [ -n "$TPROXY_PORT" ]; then
-	"$BIN" -c "$CONF" -tproxy-port "$TPROXY_PORT" -list bypass
+	"$BIN" -c "$CONF" -tproxy-port "$TPROXY_PORT" -list bypass ||
+		say "warning: could not set the TPROXY port of the routing list bypass; set it on the Routing page"
 fi
 
 if [ -n "$START" ]; then
-	"$INIT" start
+	if "$INIT" start; then
+		:
+	else
+		say "warning: kdnsfilter is installed but not running, see $LOG"
+	fi
 fi
 
 LAN_IP=$(ip -4 addr show br0 2>/dev/null | awk '/inet /{ sub(/\/.*/, "", $2); print $2; exit }')

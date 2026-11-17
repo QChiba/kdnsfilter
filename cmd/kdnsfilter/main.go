@@ -108,9 +108,19 @@ func run(path string) error {
 		log.Printf("modules: %v", err)
 	}
 	queueErr := make(chan error, 1)
-	go func() { queueErr <- a.RunQueue(ctx, cfg.NFQueue.Queue) }()
-	// Install rules only once the queue is bound; --queue-bypass covers the gap anyway.
-	time.Sleep(200 * time.Millisecond)
+	bound := make(chan struct{}, 1)
+	go func() { queueErr <- a.RunQueue(ctx, cfg.NFQueue.Queue, bound) }()
+	// Install the rules only once the queue is bound (or it failed fast);
+	// --queue-bypass covers the gap anyway.
+	select {
+	case <-bound:
+	case err := <-queueErr:
+		if err != nil {
+			log.Printf("queue: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		log.Printf("queue not bound after 3s, installing the rules anyway")
+	}
 	if cfg.NFQueue.ManageFirewall {
 		// The routing rules stay when kdnsfilter stops: the sets keep their
 		// entries, so routing goes on across restarts.
@@ -124,9 +134,14 @@ func run(path string) error {
 	defer a.Close() // flush the query log and save statistics
 
 	srv := &http.Server{
-		Addr:              cfg.HTTP.Address,
-		Handler:           web.New(a, version).Handler(),
+		Addr:    cfg.HTTP.Address,
+		Handler: web.New(a, version).Handler(),
+		// A LAN device (or a compromised IoT gadget) must not be able to
+		// pin connections or trickle a request body forever. WriteTimeout
+		// stays off: some handlers (list refresh) run for minutes.
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
 	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -187,7 +202,11 @@ func firewallCmd(path, op, family string) error {
 		return ensureRouting(cfg, family)
 	case "remove":
 		// What kdnsfilter undoes when it stops (init script, after a kill):
-		// the routing rules stay, the sets keep routing.
+		// the routing rules stay, the sets keep routing. Like ensure, this
+		// leaves the firewall alone when the user manages it themselves.
+		if !cfg.NFQueue.ManageFirewall {
+			return nil
+		}
 		firewall.Remove(rules)
 		return nil
 	case "remove-all":

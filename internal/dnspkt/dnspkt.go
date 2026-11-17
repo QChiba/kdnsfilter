@@ -127,6 +127,9 @@ func Reply(resp *dns.Msg) *dns.Msg {
 	r.Response = true
 	r.Opcode = resp.Opcode
 	r.RecursionDesired = resp.RecursionDesired
+	// RFC 4035: a validating stub that set CD=1 on its query expects it
+	// echoed in the reply it receives.
+	r.CheckingDisabled = resp.CheckingDisabled
 	r.RecursionAvailable = true
 	r.Question = resp.Question
 	if opt := resp.IsEdns0(); opt != nil {

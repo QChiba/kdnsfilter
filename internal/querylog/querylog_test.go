@@ -1,12 +1,14 @@
 package querylog
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -216,4 +218,23 @@ func TestRouteFilter(t *testing.T) {
 			t.Errorf("%+v direct: %v", tc.q, got)
 		}
 	}
+}
+
+func TestShutdownPreservesPendingHistory(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		dir := t.TempDir()
+		l := New(dir, 1, true, 24*time.Hour)
+		ctx, cancel := context.WithCancel(context.Background())
+		go l.Run(ctx)
+		synctest.Wait()
+		for i := range 100 {
+			l.Add(Entry{Time: time.Now().Add(time.Duration(i)), Host: "restart.example"})
+		}
+		cancel()
+		synctest.Wait()
+		reopened := New(dir, 1, true, 24*time.Hour)
+		if got := len(reopened.Find(Query{}).Entries); got != 100 {
+			t.Fatalf("reopened log contains %d entries, want 100", got)
+		}
+	})
 }

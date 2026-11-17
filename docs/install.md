@@ -74,8 +74,9 @@ The installer:
    Netfilter component is missing);
 2. installs the Entware packages kdnsfilter uses: `iptables`, `ip-full`,
    `ca-certificates` (and `curl`), only those not already present;
-3. downloads the latest release for the router's CPU from GitHub and checks
-   its SHA-256;
+3. downloads the latest release for the router's CPU from GitHub and verifies
+   its SHA-256 against the release's `SHA256SUMS` (the install fails if the
+   checksum can't be verified);
 4. installs `/opt/sbin/kdnsfilter`, the init script
    `/opt/etc/init.d/S80kdnsfilter` (Entware starts it at boot) and the ndm hook
    `/opt/etc/ndm/netfilter.d/50-kdnsfilter.sh`, which restores kdnsfilter's

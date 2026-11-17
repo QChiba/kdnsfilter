@@ -10,6 +10,7 @@ import (
 	"github.com/miekg/dns"
 
 	"github.com/QChiba/kdnsfilter/internal/config"
+	"github.com/QChiba/kdnsfilter/internal/ipset"
 )
 
 // fakeSets records what the router asks the kernel to do.
@@ -17,6 +18,7 @@ type fakeSets struct {
 	sets    map[string]map[netip.Addr]time.Duration
 	adds    int
 	created []string
+	fail    bool // make every Add fail with a full set
 }
 
 func newFakeSets() *fakeSets { return &fakeSets{sets: map[string]map[netip.Addr]time.Duration{}} }
@@ -31,6 +33,9 @@ func (f *fakeSets) Create(name string, v6 bool, timeout time.Duration, maxElem u
 
 func (f *fakeSets) Add(set string, a netip.Addr, timeout time.Duration) error {
 	f.adds++
+	if f.fail {
+		return ipset.ErrHashFull
+	}
 	f.sets[set][a] = timeout
 	return nil
 }
@@ -249,6 +254,37 @@ func TestSnapshotRestoresAfterReboot(t *testing.T) {
 	New(f3, path).Configure(routingCfg("youtube.com"), now.Add(2*time.Hour))
 	if len(f3.sets["kdf_bypass4"]) != 0 {
 		t.Errorf("expired entries restored: %v", f3.sets)
+	}
+}
+
+// When the kernel reports a full set, put() must back off instead of
+// attempting a netlink add (and logging a failure) for every answer.
+func TestHashFullBacksOff(t *testing.T) {
+	f := newFakeSets()
+	r := New(f, "")
+	r.Configure(routingCfg("youtube.com"), time.Now())
+	now := time.Now()
+	ans := rrs(t, "youtube.com. 60 IN A 142.250.1.1")
+	f.fail = true
+	r.Route("youtube.com", ans, now)
+	if f.adds != 1 {
+		t.Fatalf("adds %d, want one failed attempt", f.adds)
+	}
+	// Within the backoff window nothing is attempted again.
+	r.Route("youtube.com", ans, now.Add(30*time.Second))
+	if f.adds != 1 {
+		t.Errorf("no backoff: adds %d", f.adds)
+	}
+	// After the window the add is retried.
+	r.Route("youtube.com", ans, now.Add(2*time.Minute))
+	if f.adds != 2 {
+		t.Errorf("backed off forever: adds %d", f.adds)
+	}
+	// And with the backend healthy again the entry is added normally.
+	f.fail = false
+	r.Route("youtube.com", ans, now.Add(3*time.Minute))
+	if !f.has("kdf_bypass4", "142.250.1.1") {
+		t.Errorf("sets %v", f.sets)
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/miekg/dns"
 
 	"github.com/QChiba/kdnsfilter/internal/config"
+	"github.com/QChiba/kdnsfilter/internal/disk"
 	"github.com/QChiba/kdnsfilter/internal/ipset"
 )
 
@@ -53,6 +54,10 @@ type list struct {
 	cfg        config.RouteList
 	set4, set6 string
 	entries    map[netip.Addr]*entry
+	// fullUntil: the set is at maxelem; retrying the add on every answer
+	// would cost a netlink round trip per reply, so put() backs off until
+	// this (entries expire and make room on their own).
+	fullUntil time.Time
 }
 
 type entry struct {
@@ -160,7 +165,7 @@ func (r *Router) restore(l *list, saved map[netip.Addr]*entry, now time.Time) {
 		if left < time.Minute || len(e.Names) == 0 {
 			continue
 		}
-		if r.add(l, a, left) {
+		if r.add(l, a, left, now) {
 			l.entries[a] = e
 			n++
 		}
@@ -269,13 +274,16 @@ func (r *Router) Prefill(listName, name string, addrs []netip.Addr, now time.Tim
 // lookup.
 func (r *Router) put(l *list, a netip.Addr, name string, ttl time.Duration, now time.Time) {
 	a = a.Unmap()
-	if !a.IsValid() || a.IsUnspecified() || a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() {
+	if !a.IsValid() || a.IsUnspecified() || a.IsLoopback() || a.IsMulticast() || a.IsPrivate() || a.IsLinkLocalUnicast() {
 		return // blocked/rewritten answers and LAN addresses are never routed
+	}
+	if now.Before(l.fullUntil) {
+		return
 	}
 	timeout := min(max(ttl, r.min), ipset.MaxTimeout)
 	e := l.entries[a]
 	if e == nil || e.Expires.Sub(now) < timeout/2 {
-		if !r.add(l, a, timeout) {
+		if !r.add(l, a, timeout, now) {
 			return
 		}
 		if e == nil {
@@ -292,7 +300,7 @@ func (r *Router) put(l *list, a netip.Addr, name string, ttl time.Duration, now 
 	}
 }
 
-func (r *Router) add(l *list, a netip.Addr, timeout time.Duration) bool {
+func (r *Router) add(l *list, a netip.Addr, timeout time.Duration, now time.Time) bool {
 	if r.backend == nil {
 		return true // tracked only
 	}
@@ -300,7 +308,13 @@ func (r *Router) add(l *list, a netip.Addr, timeout time.Duration) bool {
 	if a.Is6() {
 		set = l.set6
 	}
-	if err := r.backend.Add(set, a, timeout); err != nil {
+	err := r.backend.Add(set, a, timeout)
+	if errors.Is(err, ipset.ErrHashFull) {
+		// The set is full: back off instead of failing on every answer, and
+		// retry when the next entry expires.
+		l.fullUntil = now.Add(time.Minute)
+	}
+	if err != nil {
 		r.fail(fmt.Errorf("add %s to %s: %w", a, set, err))
 		return false
 	}
@@ -437,11 +451,7 @@ func (r *Router) Save() error {
 	if err := os.MkdirAll(filepath.Dir(r.path), 0o755); err != nil {
 		return err
 	}
-	tmp := r.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, r.path)
+	return disk.Write(r.path, b, 0o644)
 }
 
 func (r *Router) load() {
