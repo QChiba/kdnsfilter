@@ -62,15 +62,16 @@ type Log struct {
 
 	// Disk writing. When async (Run is running), Add hands entries to ch
 	// and the Run goroutine does the writes under wmu.
-	wmu     sync.Mutex
-	w       *os.File
-	bw      *bufio.Writer
-	fileDay string
-	async   bool
-	ch      chan queued
-	gen     uint64 // bumped by Clear/Configure: entries of older generations are dropped
-	dropped atomic.Uint64
-	idle    *sync.Cond // broadcast under mu whenever ch is empty
+	wmu                 sync.Mutex
+	w                   *os.File
+	bw                  *bufio.Writer
+	fileDay             string
+	async               bool
+	ch                  chan queued
+	gen                 uint64 // bumped by Clear/Configure: entries of older generations are dropped
+	dropped             atomic.Uint64
+	idle                *sync.Cond
+	enqueued, completed uint64 // protected by mu
 }
 
 // queued pairs an entry with the generation it was recorded in.
@@ -102,10 +103,10 @@ func (l *Log) Configure(size int, enabled bool, retention time.Duration) {
 		l.buf, l.next, l.full = make([]Entry, size), 0, false
 	}
 	l.gen++ // the writer drops entries queued for settings that no longer hold
-	ch := l.ch
-	l.mu.Unlock()
-	drain(ch)
+	defer l.mu.Unlock()
 	if !l.persisting() {
+		l.wmu.Lock()
+		defer l.wmu.Unlock()
 		l.closeFile()
 	}
 }
@@ -123,26 +124,22 @@ func (l *Log) Add(e Entry) {
 	if l.next == 0 {
 		l.full = true
 	}
-	var ch chan queued
-	gen := l.gen
-	if l.persisting() {
-		if l.async {
-			ch = l.ch
-		} else {
-			// No writer goroutine: write here, briefly.
-			l.wmu.Lock()
-			l.write(e)
-			l.wmu.Unlock()
-		}
+	defer l.mu.Unlock()
+	if !l.persisting() {
+		return
 	}
-	l.mu.Unlock()
-	if ch != nil {
+	if l.async {
 		select {
-		case ch <- queued{e, gen}:
+		case l.ch <- queued{e, l.gen}:
+			l.enqueued++
 		default:
 			l.dropped.Add(1)
 		}
+		return
 	}
+	l.wmu.Lock()
+	l.write(e)
+	l.wmu.Unlock()
 }
 
 // write appends e to its day's file. Callers hold wmu. Errors only cost the
@@ -176,26 +173,12 @@ func (l *Log) closeFile() {
 	}
 }
 
-// drain empties a queue without blocking.
-func drain(ch chan queued) {
-	if ch == nil {
-		return
-	}
-	for {
-		select {
-		case <-ch:
-		default:
-			return
-		}
-	}
-}
-
 // Flush waits until every recorded entry has been written to the day file
 // and flushed to the OS.
 func (l *Log) Flush() {
 	l.mu.Lock()
 	if l.async {
-		for len(l.ch) > 0 {
+		for target := l.enqueued; l.completed < target; {
 			l.idle.Wait()
 		}
 	}
@@ -210,6 +193,8 @@ func (l *Log) Flush() {
 // Close flushes and closes the current file.
 func (l *Log) Close() {
 	l.Flush()
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
 	l.closeFile()
 }
 
@@ -218,16 +203,14 @@ func (l *Log) Clear() error {
 	l.mu.Lock()
 	l.gen++
 	l.buf, l.next, l.full = make([]Entry, len(l.buf)), 0, false
-	ch := l.ch
-	l.mu.Unlock()
-	drain(ch) // the writer discards other old-generation entries itself
+	defer l.mu.Unlock()
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
 	l.closeFile()
-	l.mu.Lock()
 	var errs []error
 	for _, p := range l.files() {
 		errs = append(errs, os.Remove(p))
 	}
-	l.mu.Unlock()
 	return errors.Join(errs...)
 }
 
@@ -238,10 +221,15 @@ func (l *Log) Cleanup(now time.Time) {
 	if l.retention <= 0 {
 		return
 	}
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
 	cut := now.Add(-l.retention)
 	for _, p := range l.files() {
 		day, err := time.ParseInLocation(time.DateOnly, strings.TrimSuffix(filepath.Base(p), fileExt), time.Local)
-		if err == nil && day.Add(24*time.Hour).Before(cut) && filepath.Base(p) != l.fileDay+fileExt {
+		if err == nil && !day.AddDate(0, 0, 1).After(cut) {
+			if filepath.Base(p) == l.fileDay+fileExt {
+				l.closeFile()
+			}
 			os.Remove(p)
 		}
 	}
@@ -276,30 +264,46 @@ func (l *Log) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			l.Close()
+			l.mu.Lock()
+			for len(ch) > 0 {
+				it := <-ch
+				l.wmu.Lock()
+				if l.persisting() && it.gen == l.gen {
+					l.write(it.e)
+				}
+				l.wmu.Unlock()
+				l.completed++
+			}
+			l.async = false
+			l.idle.Broadcast()
+			l.wmu.Lock()
+			l.closeFile()
+			l.wmu.Unlock()
+			l.mu.Unlock()
 			return
 		case <-flush.C:
 			if n := l.dropped.Swap(0); n > 0 {
 				log.Printf("querylog: the disk writer fell behind, dropped %d entries", n)
 			}
-			l.Flush()
+			l.wmu.Lock()
+			if l.bw != nil {
+				l.bw.Flush()
+			}
+			l.wmu.Unlock()
 		case t := <-clean.C:
 			l.Cleanup(t)
 		case it := <-ch:
 			l.mu.Lock()
 			ok := l.persisting() && it.gen == l.gen
-			l.mu.Unlock()
-			if !ok {
-				continue
-			}
 			l.wmu.Lock()
-			l.write(it.e)
-			l.wmu.Unlock()
-			// Wake a Flush waiting for the queue to drain.
-			l.mu.Lock()
-			if len(ch) == 0 {
-				l.idle.Broadcast()
+			l.mu.Unlock()
+			if ok {
+				l.write(it.e)
 			}
+			l.wmu.Unlock()
+			l.mu.Lock()
+			l.completed++
+			l.idle.Broadcast()
 			l.mu.Unlock()
 		}
 	}
