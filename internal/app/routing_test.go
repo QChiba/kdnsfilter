@@ -2,8 +2,10 @@ package app
 
 import (
 	"net/netip"
+	"slices"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/miekg/dns"
@@ -148,4 +150,53 @@ func TestAddedDomainIsPrefilledFromQueryLog(t *testing.T) {
 	if !f.has("kdf_bypass4", "151.101.1.1") || !f.has("kdf_bypass4", "151.101.2.2") || f.has("kdf_bypass4", "93.184.215.14") {
 		t.Errorf("sets %v", f.sets)
 	}
+}
+
+func TestConcurrentRoutingUpdatesApplyInCommitOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		withFakeKernel(t)
+		a := newTestApp(t, config.BlockNXDomain)
+		release := make(chan struct{})
+		started := make(chan struct{})
+		var applied []string
+		applyRouting = func(prev, next config.Routing) error {
+			name := next.Lists[0].Name
+			if name == "first" {
+				close(started)
+				<-release
+			}
+			applied = append(applied, name)
+			return nil
+		}
+		results := make(chan error, 3)
+		update := func(name string) {
+			results <- a.Update(func(c *config.Config) error {
+				c.Routing.Enabled = true
+				c.Routing.Lists = []config.RouteList{{Name: name}}
+				return nil
+			})
+		}
+		go update("first")
+		<-started
+		for _, name := range []string{"second", "third"} {
+			go update(name)
+			synctest.Wait()
+			if got := a.Config().Routing.Lists[0].Name; got != name {
+				t.Fatalf("committed list %q, want %q", got, name)
+			}
+		}
+		// An unrelated config edit can finish while the firewall is busy.
+		if err := a.Update(func(c *config.Config) error { c.QueryLog.Enabled = false; return nil }); err != nil {
+			t.Fatal(err)
+		}
+		close(release)
+		for range 3 {
+			if err := <-results; err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !slices.Equal(applied, []string{"first", "second", "third"}) {
+			t.Errorf("firewall apply order %v", applied)
+		}
+	})
 }

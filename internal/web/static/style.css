@@ -120,6 +120,7 @@ dialog::backdrop { background: rgb(0 0 0 / .4); }
 .popover .about dl { margin-bottom: 6px; }
 .popover table.queries { margin-top: 8px; font-size: 12px; }
 .popover table.queries th, .popover table.queries td { padding: 3px 14px 3px 0; }
+.popover table.queries tbody tr:last-child td { border-bottom: 0; }
 .popover table.queries td { overflow-wrap: anywhere; }
 .popover table.queries td:first-child { white-space: nowrap; }
 dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }

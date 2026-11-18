@@ -68,7 +68,7 @@ type Log struct {
 	fileDay             string
 	async               bool
 	ch                  chan queued
-	gen                 uint64 // bumped by Clear/Configure: entries of older generations are dropped
+	gen                 uint64 // bumped by Clear or when disk logging stops: entries of older generations are dropped
 	dropped             atomic.Uint64
 	idle                *sync.Cond
 	enqueued, completed uint64 // protected by mu
@@ -98,13 +98,14 @@ func (l *Log) Enabled() bool {
 // (entries on disk are kept).
 func (l *Log) Configure(size int, enabled bool, retention time.Duration) {
 	l.mu.Lock()
+	defer l.mu.Unlock()
+	wasPersisting := l.persisting()
 	l.enabled, l.retention = enabled, retention
 	if size = max(size, 1); size != len(l.buf) {
 		l.buf, l.next, l.full = make([]Entry, size), 0, false
 	}
-	l.gen++ // the writer drops entries queued for settings that no longer hold
-	defer l.mu.Unlock()
-	if !l.persisting() {
+	if wasPersisting && !l.persisting() {
+		l.gen++
 		l.wmu.Lock()
 		defer l.wmu.Unlock()
 		l.closeFile()

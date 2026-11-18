@@ -2,7 +2,10 @@ package clients
 
 import (
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -31,5 +34,29 @@ garbage
 	}
 	if m[netip.MustParseAddr("192.168.1.5")].MAC != "02:00:00:00:00:05" {
 		t.Error("mac")
+	}
+}
+
+func TestConcurrentHostMapRefresh(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hosts")
+	ip := netip.MustParseAddr("192.0.2.10")
+	const mac = "02:00:00:00:00:10"
+	if err := os.WriteFile(path, []byte("host_map 192.0.2.10 "+mac+" 0 aG9zdA\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewHostMap(path)
+	m.refreshEvery = 0
+	var wg sync.WaitGroup
+	for range 12 {
+		wg.Go(func() {
+			for range 10 {
+				m.Lookup(ip)
+				m.Devices()
+			}
+		})
+	}
+	wg.Wait()
+	if host, ok := m.Lookup(ip); !ok || host.MAC != mac {
+		t.Fatalf("host after refresh: %+v, found %v", host, ok)
 	}
 }

@@ -192,11 +192,11 @@ if [ -n "$TPROXY_PORT" ]; then
 fi
 
 if [ -n "$START" ]; then
-	if "$INIT" start; then
-		:
-	else
-		say "warning: kdnsfilter is installed but not running, see $LOG"
-	fi
+	"$INIT" start || {
+		status=$?
+		say "kdnsfilter failed to start, see $LOG" >&2
+		exit "$status"
+	}
 fi
 
 LAN_IP=$(ip -4 addr show br0 2>/dev/null | awk '/inet /{ sub(/\/.*/, "", $2); print $2; exit }')

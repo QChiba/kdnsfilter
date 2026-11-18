@@ -107,20 +107,12 @@ func run(path string) error {
 	if err := firewall.LoadModules(firewall.QueueModules...); err != nil {
 		log.Printf("modules: %v", err)
 	}
-	queueErr := make(chan error, 1)
-	bound := make(chan struct{}, 1)
-	go func() { queueErr <- a.RunQueue(ctx, cfg.NFQueue.Queue, bound) }()
-	// Install the rules only once the queue is bound (or it failed fast);
-	// --queue-bypass covers the gap anyway.
-	select {
-	case <-bound:
-	case err := <-queueErr:
-		if err != nil {
-			log.Printf("queue: %v", err)
-		}
-	case <-time.After(3 * time.Second):
-		log.Printf("queue not bound after 3s, installing the rules anyway")
+	queue, err := a.StartQueue(ctx, cfg.NFQueue.Queue)
+	if err != nil {
+		return err
 	}
+	defer a.Close()
+	defer queue.Close() // finish recording replies before flushing
 	if cfg.NFQueue.ManageFirewall {
 		// The routing rules stay when kdnsfilter stops: the sets keep their
 		// entries, so routing goes on across restarts.
@@ -131,7 +123,6 @@ func run(path string) error {
 	}
 	go a.RunUpdater(ctx)
 	go a.RunPersistence(ctx)
-	defer a.Close() // flush the query log and save statistics
 
 	srv := &http.Server{
 		Addr:    cfg.HTTP.Address,
@@ -151,18 +142,11 @@ func run(path string) error {
 	}()
 	log.Printf("kdnsfilter %s: queue %d, UI on http://%s, %d rules", version, cfg.NFQueue.Queue, cfg.HTTP.Address, a.Filter().RulesCount())
 
-	select {
-	case <-ctx.Done():
-	case err = <-queueErr:
-		if err != nil {
-			log.Printf("queue: %v", err)
-		}
-		stop()
-	}
+	<-ctx.Done()
 	shutdown, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	srv.Shutdown(shutdown)
-	return err
+	return nil
 }
 
 func fwRules(cfg *config.Config) ([]firewall.Rule, error) {

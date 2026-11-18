@@ -1,10 +1,14 @@
 package stats
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/QChiba/kdnsfilter/internal/disk"
 )
 
 func TestSummaryAndPersistence(t *testing.T) {
@@ -93,5 +97,33 @@ func TestFinishedDaysKeepTopOnly(t *testing.T) {
 	// Totals stay exact even though the top lists were trimmed.
 	if sum := s.Summary(time.Now(), 300); sum.Total != 1198 {
 		t.Errorf("total %d, want 1198", sum.Total)
+	}
+}
+
+func TestSaveKeepsChangesDuringWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stats.json")
+	s := New(path, 24*time.Hour)
+	now := time.Now()
+	s.Add(now, "first.example", "192.0.2.1", "", false, "")
+	err := s.save(func(path string, data []byte, mode os.FileMode) error {
+		// The snapshot has been taken, but its write hasn't completed yet.
+		s.Add(now, "second.example", "192.0.2.1", "", true, "")
+		return disk.Write(path, data, mode)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := New(path, 24*time.Hour).Summary(now, 10).Total; got != 1 {
+		t.Fatalf("first snapshot has %d queries", got)
+	}
+	writeErr := errors.New("write failed")
+	if err := s.save(func(string, []byte, os.FileMode) error { return writeErr }); err != writeErr {
+		t.Fatalf("pending save returned %v, want %v", err, writeErr)
+	}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if got := New(path, 24*time.Hour).Summary(now, 10); got.Total != 2 || got.Blocked != 1 {
+		t.Fatalf("reopened statistics: total %d, blocked %d", got.Total, got.Blocked)
 	}
 }

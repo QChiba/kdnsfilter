@@ -63,7 +63,10 @@ type Stats struct {
 	hours    []hour // ascending
 	days     []*day // ascending; the last one may be the current day
 	names    map[string]string
-	dirty    bool
+	revision uint64 // incremented under mu for every change
+
+	saveMu        sync.Mutex // serializes snapshots written to path
+	savedRevision uint64     // guarded by saveMu
 }
 
 type persisted struct {
@@ -107,7 +110,7 @@ func (s *Stats) SetInterval(d time.Duration) {
 	defer s.mu.Unlock()
 	s.interval = d
 	s.expire(time.Now())
-	s.dirty = true
+	s.revision++
 }
 
 func midnight(t time.Time) int64 {
@@ -140,7 +143,7 @@ func (s *Stats) Add(t time.Time, host, clientIP, clientName string, blocked bool
 	if len(d.Queried) > trimAt || len(d.Clients) > trimAt {
 		d.trim()
 	}
-	s.dirty = true
+	s.revision++
 }
 
 // hourBucket returns the bucket of hour h, creating it if needed. The
@@ -224,7 +227,8 @@ func (s *Stats) expire(now time.Time) {
 func (s *Stats) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.hours, s.days, s.names, s.dirty = nil, nil, map[string]string{}, true
+	s.hours, s.days, s.names = nil, nil, map[string]string{}
+	s.revision++
 }
 
 // snapshot copies the current state so it can be marshaled or aggregated
@@ -364,15 +368,21 @@ func top(m map[string]uint64, n int) []Count {
 	return out
 }
 
-// Save writes the statistics if they changed since the last save. The write
-// happens without the mutex; adds during it set dirty again and are saved by
-// the next call.
+// Save persists the latest snapshot. Changes made during the write remain
+// pending for the next save.
 func (s *Stats) Save() error {
+	return s.save(disk.Write)
+}
+
+func (s *Stats) save(write func(string, []byte, os.FileMode) error) error {
 	if s.path == "" {
 		return nil
 	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
 	s.mu.Lock()
-	if !s.dirty {
+	revision := s.revision
+	if s.savedRevision == revision {
 		s.mu.Unlock()
 		return nil
 	}
@@ -382,12 +392,10 @@ func (s *Stats) Save() error {
 	if err != nil {
 		return err
 	}
-	if err := disk.Write(s.path, b, 0o644); err != nil {
+	if err := write(s.path, b, 0o644); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	s.dirty = false
-	s.mu.Unlock()
+	s.savedRevision = revision
 	return nil
 }
 

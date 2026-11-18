@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/netip"
 	"strings"
@@ -18,11 +19,9 @@ import (
 	"github.com/QChiba/kdnsfilter/internal/querylog"
 )
 
-// RunQueue reads DNS replies from the NFQUEUE until ctx is cancelled.
-// Packets the filter can't handle are always accepted unchanged. When bound
-// is non-nil it receives a value once the queue is open, so the caller can
-// install the firewall rules at the right time.
-func (a *App) RunQueue(ctx context.Context, queue uint16, bound chan<- struct{}) error {
+// StartQueue binds the NFQUEUE and starts receiving replies. Close the
+// returned queue to wait for the packet handler to finish.
+func (a *App) StartQueue(ctx context.Context, queue uint16) (io.Closer, error) {
 	nf, err := nfqueue.Open(&nfqueue.Config{
 		NfQueue:      queue,
 		MaxPacketLen: 0xffff,
@@ -32,14 +31,7 @@ func (a *App) RunQueue(ctx context.Context, queue uint16, bound chan<- struct{})
 		WriteTimeout: 100 * time.Millisecond,
 	})
 	if err != nil {
-		return fmt.Errorf("open nfqueue %d: %w", queue, err)
-	}
-	defer nf.Close()
-	if bound != nil {
-		select {
-		case bound <- struct{}{}:
-		default:
-		}
+		return nil, fmt.Errorf("open nfqueue %d: %w", queue, err)
 	}
 	if err := nf.SetOption(netlink.NoENOBUFS, true); err != nil {
 		log.Printf("nfqueue: set NoENOBUFS: %v", err)
@@ -90,10 +82,10 @@ func (a *App) RunQueue(ctx context.Context, queue uint16, bound chan<- struct{})
 		return 0
 	}
 	if err := nf.RegisterWithErrorFunc(ctx, handle, onErr); err != nil {
-		return fmt.Errorf("register nfqueue: %w", err)
+		nf.Close()
+		return nil, fmt.Errorf("register nfqueue: %w", err)
 	}
-	<-ctx.Done()
-	return nil
+	return nf, nil
 }
 
 // process inspects one IP packet. It returns the replacement packet (nil to

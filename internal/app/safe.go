@@ -62,7 +62,9 @@ func (s *safeResolver) setAddr(addr string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.addr != addr {
-		s.addr, s.cache = addr, map[string]safeEntry{}
+		s.addr = addr
+		s.cache = map[string]safeEntry{}
+		s.inflight = map[string]*safeCall{}
 	}
 }
 
@@ -81,43 +83,54 @@ func (s *safeResolver) lookup(name string, qtype uint16) ([]netip.Addr, error) {
 		return nil, nil
 	}
 	key := fmt.Sprintf("%s/%d", name, qtype)
-	var call *safeCall
-	leader := false
 	s.mu.Lock()
-	e, ok := s.cache[key]
-	addr := s.addr
-	if call = s.inflight[key]; call == nil {
-		call = &safeCall{}
-		call.wg.Add(1)
-		s.inflight[key] = call
-		leader = true
+	cached, ok := s.cache[key]
+	if ok && time.Now().Before(cached.expires) {
+		s.mu.Unlock()
+		return cached.addrs, nil
 	}
-	s.mu.Unlock()
-	if !leader {
+	if call := s.inflight[key]; call != nil {
+		s.mu.Unlock()
 		call.wg.Wait()
 		return call.addrs, call.err
 	}
-
-	addrs, err := s.resolve(name, qtype, addr, e, ok)
-	s.mu.Lock()
-	delete(s.inflight, key)
+	addr := s.addr
+	call := &safeCall{}
+	call.wg.Add(1)
+	s.inflight[key] = call
 	s.mu.Unlock()
-	call.addrs, call.err = addrs, err
+
+	entry, err := s.resolve(name, qtype, addr)
+	s.mu.Lock()
+	if s.inflight[key] == call { // the configured resolver is still current
+		delete(s.inflight, key)
+		if err == nil {
+			s.cache[key] = entry
+			if len(s.cache) > safeCacheMax {
+				now := time.Now()
+				for k, v := range s.cache {
+					if !now.Before(v.expires) {
+						delete(s.cache, k)
+					}
+				}
+			}
+		}
+	}
+	if err != nil && ok {
+		entry, err = cached, nil // use the stale answer on an upstream error
+	}
+	call.addrs, call.err = entry.addrs, err
 	call.wg.Done()
-	return addrs, err
+	s.mu.Unlock()
+	return call.addrs, call.err
 }
 
-// resolve does the exchange and fills the cache; serving stale beats
-// failing. Called by the single leader of each target.
-func (s *safeResolver) resolve(name string, qtype uint16, addr string, e safeEntry, cached bool) ([]netip.Addr, error) {
+func (s *safeResolver) resolve(name string, qtype uint16, addr string) (safeEntry, error) {
 	q := new(dns.Msg)
 	q.SetQuestion(dns.Fqdn(name), qtype)
 	r, _, err := s.client.Exchange(q, addr)
 	if err != nil {
-		if cached { // serve stale rather than fail
-			return e.addrs, nil
-		}
-		return nil, fmt.Errorf("resolve %s: %w", name, err)
+		return safeEntry{}, fmt.Errorf("resolve %s: %w", name, err)
 	}
 	ttl := safeMaxTTL
 	var out []netip.Addr
@@ -135,16 +148,5 @@ func (s *safeResolver) resolve(name string, qtype uint16, addr string, e safeEnt
 		ttl = min(ttl, time.Duration(rr.Header().Ttl)*time.Second)
 	}
 	ttl = max(ttl, safeMinTTL)
-	key := fmt.Sprintf("%s/%d", name, qtype)
-	s.mu.Lock()
-	s.cache[key] = safeEntry{addrs: out, expires: time.Now().Add(ttl)}
-	if len(s.cache) > safeCacheMax {
-		for k, v := range s.cache {
-			if !time.Now().Before(v.expires) {
-				delete(s.cache, k)
-			}
-		}
-	}
-	s.mu.Unlock()
-	return out, nil
+	return safeEntry{addrs: out, expires: time.Now().Add(ttl)}, nil
 }

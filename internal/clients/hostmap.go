@@ -27,10 +27,12 @@ type HostMap struct {
 	path         string
 	refreshEvery time.Duration
 
-	mu      sync.RWMutex
-	byIP    map[netip.Addr]Host
-	modTime time.Time
-	checked time.Time
+	mu   sync.RWMutex // protects byIP
+	byIP map[netip.Addr]Host
+
+	refreshMu sync.Mutex // protects checked and modTime
+	modTime   time.Time
+	checked   time.Time
 }
 
 // Device is one MAC with every address Keenetic currently maps to it.
@@ -99,42 +101,28 @@ func firstIP(d Device) netip.Addr {
 }
 
 func (m *HostMap) refresh() {
-	if m.path == "" {
+	if m.path == "" || !m.refreshMu.TryLock() {
+		return // another reader can use the current map during a refresh
+	}
+	defer m.refreshMu.Unlock()
+	if time.Since(m.checked) < m.refreshEvery {
 		return
 	}
-	m.mu.RLock()
-	fresh := time.Since(m.checked) < m.refreshEvery
-	m.mu.RUnlock()
-	if fresh {
-		return
-	}
-	st, err := os.Stat(m.path)
-	if err != nil {
-		// Don't retry sooner than refreshEvery even on errors.
-		m.mu.Lock()
-		m.checked = time.Now()
-		m.mu.Unlock()
-		return
-	}
-	// Read and parse without holding the write lock: Lookup runs on the DNS
-	// reply path and must never wait for a file read.
-	var parsed map[netip.Addr]Host
-	var modTime time.Time
-	if !st.ModTime().Equal(m.modTime) {
-		f, err := os.Open(m.path)
-		if err == nil {
-			parsed = Parse(f)
-			f.Close()
-			modTime = st.ModTime()
-		}
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.checked = time.Now()
-	if parsed != nil {
-		m.byIP = parsed
-		m.modTime = modTime
+	st, err := os.Stat(m.path)
+	if err != nil || st.ModTime().Equal(m.modTime) {
+		return
 	}
+	f, err := os.Open(m.path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	parsed := Parse(f)
+	m.mu.Lock()
+	m.byIP = parsed
+	m.mu.Unlock()
+	m.modTime = st.ModTime()
 }
 
 // Parse reads lines like
