@@ -240,7 +240,7 @@ function explain(entries) {
       listed ? item('Source', custom ? 'Custom rules' : list) : null,
       e.reason === 'service' ? item('Source', 'Blocked services') : null,
       e.reason === 'rewrite' ? item('Source', 'DNS rewrites') : null,
-      e.route ? item('Routed', `list ${e.route}: the answer's addresses were added to its sets before the reply was sent`,
+      e.route ? item('Routed', `list ${e.route}: addresses from the answer are in its sets`,
         e.route_entry ? el('div', { class: 'small' }, e.route_via
           ? `Matched through the CNAME ${e.route_via}, which is covered by the list entry ${e.route_entry}. Add !${e.host} to the list to keep this domain out.`
           : `Matched by the list entry ${e.route_entry}.`) : null) : null,
@@ -269,7 +269,7 @@ const GROUP_WINDOW_MS = 5000;
 function groupEntries(entries) {
   const groups = [], open = new Map();
   for (const e of entries) {
-    const k = [e.client_name || e.client_ip, e.host, e.action, e.reason, e.rule, e.cname].join('\n');
+    const k = [e.client_name || e.client_ip, e.host, e.action, e.reason, e.rule, e.cname, e.route].join('\n');
     const g = open.get(k);
     if (g && Date.parse(g[0].time) - Date.parse(e.time) <= GROUP_WINDOW_MS) {
       g.push(e);
@@ -561,7 +561,7 @@ async function queryLog(main) {
       el('td', { class: 'host' }, e.host,
         el('div', { class: 'small qtypes' }, typeCounts(g).map(([type, n]) => n > 1 ? `${type} ×${n}` : type).join(' · ')),
         e.cname ? el('div', { class: 'small' }, 'via CNAME ', e.cname) : null,
-        e.route ? el('span', { class: 'badge route', title: 'Addresses added to the sets of routing list ' + e.route }, '→ ' + e.route) : null),
+        e.route ? el('span', { class: 'badge route', title: 'Answer addresses in the sets of routing list ' + e.route }, '→ ' + e.route) : null),
       el('td', {}, why(g)),
       el('td', { class: 'nowrap' }, btn));
   }

@@ -54,10 +54,8 @@ type list struct {
 	cfg        config.RouteList
 	set4, set6 string
 	entries    map[netip.Addr]*entry
-	// fullUntil: the set is at maxelem; retrying the add on every answer
-	// would cost a netlink round trip per reply, so put() backs off until
-	// this (entries expire and make room on their own).
-	fullUntil time.Time
+	// Each kernel set backs off independently after reaching maxelem.
+	fullUntil4, fullUntil6 time.Time
 }
 
 type entry struct {
@@ -104,6 +102,7 @@ func (r *Router) Configure(cfg config.Routing, now time.Time) map[string][]strin
 			r.createSets(l)
 			if o := old[c.Name]; o != nil && o.set4 == v4 && o.set6 == v6 {
 				l.entries = o.entries
+				l.fullUntil4, l.fullUntil6 = o.fullUntil4, o.fullUntil6
 				delete(old, c.Name)
 				if d := newDomains(o.cfg.Domains, c.Domains); len(d) > 0 {
 					added[c.Name] = d
@@ -242,11 +241,15 @@ func (r *Router) Route(host string, answers []dns.RR, now time.Time) Routed {
 		}
 	}
 	l := r.lists[i]
+	routed := false
 	for _, rr := range answers {
 		ttl := time.Duration(rr.Header().Ttl) * time.Second
 		for _, a := range addrsOf(rr) {
-			r.put(l, a, name, ttl, now)
+			routed = r.put(l, a, name, ttl, now) || routed
 		}
+	}
+	if !routed || r.backend == nil {
+		return Routed{}
 	}
 	return Routed{List: l.cfg.Name, Entry: entry, Via: via}
 }
@@ -272,19 +275,16 @@ func (r *Router) Prefill(listName, name string, addrs []netip.Addr, now time.Tim
 // put adds or refreshes one address for name. Netlink is only used when the
 // entry is new or past half its lifetime, so repeated answers cost a map
 // lookup.
-func (r *Router) put(l *list, a netip.Addr, name string, ttl time.Duration, now time.Time) {
+func (r *Router) put(l *list, a netip.Addr, name string, ttl time.Duration, now time.Time) bool {
 	a = a.Unmap()
 	if !a.IsValid() || a.IsUnspecified() || a.IsLoopback() || a.IsMulticast() || a.IsPrivate() || a.IsLinkLocalUnicast() {
-		return // blocked/rewritten answers and LAN addresses are never routed
-	}
-	if now.Before(l.fullUntil) {
-		return
+		return false // blocked/rewritten answers and LAN addresses are never routed
 	}
 	timeout := min(max(ttl, r.min), ipset.MaxTimeout)
 	e := l.entries[a]
 	if e == nil || e.Expires.Sub(now) < timeout/2 {
 		if !r.add(l, a, timeout, now) {
-			return
+			return false
 		}
 		if e == nil {
 			e = &entry{}
@@ -298,21 +298,25 @@ func (r *Router) put(l *list, a netip.Addr, name string, ttl time.Duration, now 
 			e.Names = e.Names[len(e.Names)-maxNames:]
 		}
 	}
+	return true
 }
 
 func (r *Router) add(l *list, a netip.Addr, timeout time.Duration, now time.Time) bool {
 	if r.backend == nil {
 		return true // tracked only
 	}
-	set := l.set4
+	set, fullUntil := l.set4, &l.fullUntil4
 	if a.Is6() {
-		set = l.set6
+		set, fullUntil = l.set6, &l.fullUntil6
+	}
+	if now.Before(*fullUntil) {
+		return false
 	}
 	err := r.backend.Add(set, a, timeout)
 	if errors.Is(err, ipset.ErrHashFull) {
 		// The set is full: back off instead of failing on every answer, and
 		// retry when the next entry expires.
-		l.fullUntil = now.Add(time.Minute)
+		*fullUntil = now.Add(time.Minute)
 	}
 	if err != nil {
 		r.fail(fmt.Errorf("add %s to %s: %w", a, set, err))

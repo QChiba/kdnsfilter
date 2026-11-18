@@ -256,6 +256,7 @@ kdnsfilter to answer.
 | `kernel module xt_NFQUEUE is missing` | install the *Netfilter subsystem kernel modules* component (section 2) |
 | Some devices aren't filtered | they use their own DNS: browser "secure DNS" / DoH (Chrome, Edge), iCloud Private Relay, a hard-coded DNS server; or IPv6 DNS from the ISP — let the router advertise itself |
 | A site breaks | find its lookups in the query log and unblock them with one click |
+| A bypass domain shows `REFUSED` or `SERVFAIL` | Check the router's upstream DNS. kdnsfilter receives an error reply with no addresses to add to the bypass sets. Test the domain with the router's DNS first. |
 | Routed sites don't open | the proxy listens on the port for both TCP and UDP (`netstat -lnp`); `lsmod \| grep -E 'TPROXY\|socket'`; the log for `firewall:` errors; the Routing page shows an error if the sets couldn't be filled |
 | Rules gone after KeeneticOS changes | the hook `/opt/etc/ndm/netfilter.d/50-kdnsfilter.sh` exists and is executable; `kdnsfilter -firewall ensure` re-adds everything by hand |
 

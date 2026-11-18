@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -47,11 +48,11 @@ type App struct {
 	Hosts   *clients.HostMap
 	Routing *routing.Router
 
-	mu     sync.Mutex                    // serialises config changes and rebuilds
-	rtMu   sync.Mutex                    // serialises routing/firewall application
-	cfg    atomic.Pointer[config.Config] // immutable snapshot, replaced by Update
-	status map[uint64]ListStatus
-	filter atomic.Pointer[filtering.Filter]
+	mu          sync.Mutex                    // serialises config changes and rebuilds
+	routingDone chan struct{}                 // guarded by mu; closed when the latest routing change finishes
+	cfg         atomic.Pointer[config.Config] // immutable snapshot, replaced by Update
+	status      map[uint64]ListStatus
+	filter      atomic.Pointer[filtering.Filter]
 	// Compiled lists + user rules, reused while their inputs are unchanged
 	// (guarded by mu).
 	rules       *filtering.Rules
@@ -164,7 +165,20 @@ func (a *App) Update(fn func(*config.Config) error) error {
 	a.Log.Configure(next.QueryLog.Size, next.QueryLog.Enabled, time.Duration(next.QueryLog.Interval))
 	a.Stats.SetInterval(time.Duration(next.Stats.Interval))
 	a.safe.setAddr(next.Resolver)
+	if reflect.DeepEqual(prev.Routing, next.Routing) {
+		a.mu.Unlock()
+		return nil
+	}
+	// Reserve our place while the config commits are still serialized.
+	// Other settings can be saved while a firewall operation is waiting.
+	previous := a.routingDone
+	done := make(chan struct{})
+	a.routingDone = done
 	a.mu.Unlock()
+	defer close(done)
+	if previous != nil {
+		<-previous
+	}
 	a.routingChanged(prev, next)
 	return nil
 }

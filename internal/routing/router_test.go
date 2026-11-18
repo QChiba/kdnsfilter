@@ -18,7 +18,7 @@ type fakeSets struct {
 	sets    map[string]map[netip.Addr]time.Duration
 	adds    int
 	created []string
-	fail    bool // make every Add fail with a full set
+	fullSet string // this set returns ErrHashFull
 }
 
 func newFakeSets() *fakeSets { return &fakeSets{sets: map[string]map[netip.Addr]time.Duration{}} }
@@ -33,7 +33,7 @@ func (f *fakeSets) Create(name string, v6 bool, timeout time.Duration, maxElem u
 
 func (f *fakeSets) Add(set string, a netip.Addr, timeout time.Duration) error {
 	f.adds++
-	if f.fail {
+	if set == f.fullSet {
 		return ipset.ErrHashFull
 	}
 	f.sets[set][a] = timeout
@@ -265,7 +265,7 @@ func TestHashFullBacksOff(t *testing.T) {
 	r.Configure(routingCfg("youtube.com"), time.Now())
 	now := time.Now()
 	ans := rrs(t, "youtube.com. 60 IN A 142.250.1.1")
-	f.fail = true
+	f.fullSet = "kdf_bypass4"
 	r.Route("youtube.com", ans, now)
 	if f.adds != 1 {
 		t.Fatalf("adds %d, want one failed attempt", f.adds)
@@ -275,13 +275,17 @@ func TestHashFullBacksOff(t *testing.T) {
 	if f.adds != 1 {
 		t.Errorf("no backoff: adds %d", f.adds)
 	}
+	r.Route("youtube.com", rrs(t, "youtube.com. 60 IN AAAA 2001:db8::1"), now.Add(30*time.Second))
+	if !f.has("kdf_bypass6", "2001:db8::1") {
+		t.Fatal("a full IPv4 set suppressed the IPv6 route")
+	}
 	// After the window the add is retried.
 	r.Route("youtube.com", ans, now.Add(2*time.Minute))
-	if f.adds != 2 {
+	if f.adds != 3 {
 		t.Errorf("backed off forever: adds %d", f.adds)
 	}
 	// And with the backend healthy again the entry is added normally.
-	f.fail = false
+	f.fullSet = ""
 	r.Route("youtube.com", ans, now.Add(3*time.Minute))
 	if !f.has("kdf_bypass4", "142.250.1.1") {
 		t.Errorf("sets %v", f.sets)
@@ -302,5 +306,30 @@ func TestPrefillOnlyForItsList(t *testing.T) {
 	r.Prune(now.Add(2 * time.Hour))
 	if lists, _ := r.Status(); lists[0].Count4 != 0 {
 		t.Errorf("prune kept %d", lists[0].Count4)
+	}
+}
+
+func TestRouteBadgeRequiresAddressInSet(t *testing.T) {
+	now := time.Now()
+	f := newFakeSets()
+	r := New(f, "")
+	r.Configure(routingCfg("clamav.net"), now)
+	const host = "current.cvd.clamav.net"
+	for _, rr := range []string{
+		host + ". 60 IN TXT \"version\"",
+		host + ". 60 IN A 192.168.1.5",
+	} {
+		if got := r.Route(host, rrs(t, rr), now); got.List != "" {
+			t.Errorf("reply %s was marked routed: %+v", rr, got)
+		}
+	}
+	answer := rrs(t, "clamav.net. 60 IN A 192.0.2.10")
+	f.fullSet = "kdf_bypass4"
+	if got := r.Route("clamav.net", answer, now); got.List != "" {
+		t.Errorf("failed set insertion was marked routed: %+v", got)
+	}
+	f.fullSet = ""
+	if got := r.Route("clamav.net", answer, now.Add(time.Minute)); got.List != "bypass" {
+		t.Errorf("successful set insertion was not marked routed: %+v", got)
 	}
 }
