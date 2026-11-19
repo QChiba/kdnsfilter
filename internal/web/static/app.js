@@ -229,6 +229,7 @@ function explain(entries) {
   const from = fmtTime(entries[entries.length - 1].time), to = fmtTime(e.time);
   const when = from === to ? to : `${from} – ${new Date(e.time).toLocaleTimeString()}`;
   const addrs = clientAddrs(entries);
+  const hasRoutes = entries.some(x => x.route);
   const ms = us => (us / 1000).toFixed(us < 10000 ? 2 : 0);
   const took = entries.map(x => x.elapsed_us || 0), lo = Math.min(...took), hi = Math.max(...took);
   return [
@@ -240,17 +241,14 @@ function explain(entries) {
       listed ? item('Source', custom ? 'Custom rules' : list) : null,
       e.reason === 'service' ? item('Source', 'Blocked services') : null,
       e.reason === 'rewrite' ? item('Source', 'DNS rewrites') : null,
-      e.route ? item('Routed', `list ${e.route}: addresses from the answer are in its sets`,
-        e.route_entry ? el('div', { class: 'small' }, e.route_via
-          ? `Matched through the CNAME ${e.route_via}, which is covered by the list entry ${e.route_entry}. Add !${e.host} to the list to keep this domain out.`
-          : `Matched by the list entry ${e.route_entry}.`) : null) : null,
       hi ? item('Filter time', lo === hi ? ms(hi) + ' ms' : `${ms(lo)}–${ms(hi)} ms`) : null),
     el('table', { class: 'queries' },
       el('thead', {}, el('tr', {}, el('th', {}, 'Type'), addrs.length > 1 ? el('th', {}, 'From') : null,
-        el('th', {}, 'Response'), el('th', {}, 'Answers'))),
+        el('th', {}, 'Response'), el('th', {}, 'Answers'), hasRoutes ? el('th', {}, 'Routing') : null)),
       el('tbody', {}, [...entries].reverse().map(x => el('tr', {},
         el('td', {}, x.qtype), addrs.length > 1 ? el('td', {}, x.client_ip) : null, el('td', {}, x.rcode || '—'),
-        el('td', {}, x.answers && x.answers.length ? x.answers.map(a => el('div', {}, a)) : '—'))))),
+        el('td', {}, x.answers && x.answers.length ? x.answers.map(a => el('div', {}, a)) : '—'),
+        hasRoutes ? el('td', { title: routeMatch(x) }, x.route || '—') : null)))),
     about,
     custom && e.rule ? el('div', { class: 'actions' },
       el('button', { class: 'small', onclick: () => { focusRule = e.rule; hideDetails(); location.hash = '#filters'; } }, 'Show in custom rules')) : null,
@@ -269,7 +267,7 @@ const GROUP_WINDOW_MS = 5000;
 function groupEntries(entries) {
   const groups = [], open = new Map();
   for (const e of entries) {
-    const k = [e.client_name || e.client_ip, e.host, e.action, e.reason, e.rule, e.cname, e.route].join('\n');
+    const k = [e.client_name || e.client_ip, e.host, e.action, e.reason, e.rule, e.cname].join('\n');
     const g = open.get(k);
     if (g && Date.parse(g[0].time) - Date.parse(e.time) <= GROUP_WINDOW_MS) {
       g.push(e);
@@ -280,6 +278,14 @@ function groupEntries(entries) {
     groups.push(ng);
   }
   return groups;
+}
+
+// routeMatch explains which domain put this reply's addresses in the routing set.
+function routeMatch(e) {
+  if (!e.route_entry) return '';
+  return e.route_via
+    ? `Matched ${e.route_entry} through CNAME ${e.route_via}`
+    : `Matched ${e.route_entry}`;
 }
 
 // clientAddrs lists a group's distinct client addresses.
@@ -553,6 +559,7 @@ async function queryLog(main) {
       ? el('button', { class: 'small', onclick: () => quick(e.cname || e.host, 'allow') }, 'Unblock')
       : el('button', { class: 'small danger', onclick: () => quick(e.host, 'block') }, 'Block');
     const t = new Date(e.time);
+    const routes = [...new Set(g.map(x => x.route).filter(Boolean))];
     return el('tr', { class: e.action },
       el('td', { class: 'nowrap small', title: t.toLocaleString() },
         t.toDateString() === new Date().toDateString() ? t.toLocaleTimeString() : t.toLocaleString()),
@@ -561,7 +568,7 @@ async function queryLog(main) {
       el('td', { class: 'host' }, e.host,
         el('div', { class: 'small qtypes' }, typeCounts(g).map(([type, n]) => n > 1 ? `${type} ×${n}` : type).join(' · ')),
         e.cname ? el('div', { class: 'small' }, 'via CNAME ', e.cname) : null,
-        e.route ? el('span', { class: 'badge route', title: 'Answer addresses in the sets of routing list ' + e.route }, '→ ' + e.route) : null),
+        routes.map(route => el('span', { class: 'badge route', title: 'Reply addresses in the sets of routing list ' + route }, '→ ' + route))),
       el('td', {}, why(g)),
       el('td', { class: 'nowrap' }, btn));
   }
